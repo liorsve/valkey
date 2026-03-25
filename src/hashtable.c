@@ -1368,6 +1368,12 @@ size_t hashtableTrackedDataBytes(hashtable *ht) {
     return ht->tracked_data_bytes;
 }
 
+/* Adjusts tracked_data_bytes by delta. Use this when an entry is modified
+ * in-place (e.g. value update) without going through insert/remove. */
+void hashtableAdjustTrackedDataBytes(hashtable *ht, ssize_t delta) {
+    ht->tracked_data_bytes += delta;
+}
+
 /* Pauses automatic shrinking. This can be called before deleting a lot of
  * entries, to prevent automatic shrinking from being triggered multiple times.
  * Call hashtableResumeAutoShrink afterwards to restore automatic shrinking. */
