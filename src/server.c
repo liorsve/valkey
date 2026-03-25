@@ -626,8 +626,7 @@ hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictSdsDestructor,
-    .entryGetSize = sdsEntryGetSize
-};
+    .entryGetSize = sdsEntryGetSize};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;
@@ -722,6 +721,10 @@ size_t hashHashtableTypeMetadataSize(void) {
     return sizeof(void *);
 }
 
+size_t hashEntryGetSize(const void *entry) {
+    return entryGetLogicalSize(entry);
+}
+
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
@@ -729,6 +732,7 @@ hashtableType hashHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
@@ -737,6 +741,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
 };

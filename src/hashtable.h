@@ -130,6 +130,7 @@ size_t hashtableChainedBuckets(hashtable *ht, int table);
 unsigned hashtableEntriesPerBucket(void);
 size_t hashtableMemUsage(const hashtable *ht);
 size_t hashtableTrackedDataBytes(hashtable *ht);
+void hashtableAdjustTrackedDataBytes(hashtable *ht, ssize_t delta);
 void hashtablePauseAutoShrink(hashtable *ht);
 void hashtableResumeAutoShrink(hashtable *ht);
 bool hashtableIsRehashing(hashtable *ht);

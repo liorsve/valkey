@@ -50,19 +50,21 @@ static size_t computeExpectedDataBytes(hashtable *ht) {
     return total;
 }
 
-#define ASSERT_TRACKED_CORRECT(ht)                                 \
-    do {                                                           \
-        size_t _expected = computeExpectedDataBytes(ht);           \
-        ASSERT_EQ(hashtableTrackedDataBytes(ht), _expected)        \
-            << "tracked_data_bytes mismatch";                      \
+#define ASSERT_TRACKED_CORRECT(ht)                          \
+    do {                                                    \
+        size_t _expected = computeExpectedDataBytes(ht);    \
+        ASSERT_EQ(hashtableTrackedDataBytes(ht), _expected) \
+            << "tracked_data_bytes mismatch";               \
     } while (0)
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
-/* Add a C-string to a SET robj. Handles ownership correctly. */
+/* Add a C-string to a SET robj. setTypeAdd never takes ownership of the
+ * passed SDS — it always copies — so we always free. */
 static void setAdd(robj *set, const char *str) {
     sds s = sdsnew(str);
-    if (!setTypeAdd(set, s)) sdsfree(s);
+    setTypeAdd(set, s);
+    sdsfree(s);
 }
 
 /* Remove a C-string from a SET robj. */
@@ -278,6 +280,7 @@ TEST_F(SetTrackingTest, ConvertListpackToHashtable) {
         snprintf(buf, sizeof(buf), "lp_elem_%d", i);
         sds s = sdsnew(buf);
         setTypeAdd(set, s);
+        sdsfree(s);
     }
     ASSERT_EQ(set->encoding, static_cast<unsigned int>(OBJ_ENCODING_LISTPACK));
 
@@ -305,6 +308,7 @@ TEST_F(SetTrackingTest, ConvertIntsetToHashtable) {
     for (int i = 0; i < 10; i++) {
         sds s = sdsfromlonglong(i);
         setTypeAdd(set, s);
+        sdsfree(s);
     }
     ASSERT_EQ(set->encoding, static_cast<unsigned int>(OBJ_ENCODING_INTSET));
 
@@ -312,6 +316,7 @@ TEST_F(SetTrackingTest, ConvertIntsetToHashtable) {
     server.set_max_listpack_entries = 0; /* skip listpack */
     sds non_int = sdsnew("not_an_integer");
     setTypeAdd(set, non_int);
+    sdsfree(non_int);
     ASSERT_EQ(set->encoding, static_cast<unsigned int>(OBJ_ENCODING_HASHTABLE));
 
     hashtable *ht = static_cast<hashtable *>(objectGetVal(set));
@@ -335,6 +340,7 @@ TEST_F(SetTrackingTest, ListpackOverflowToHashtable) {
         snprintf(buf, sizeof(buf), "overflow_%d", i);
         sds s = sdsnew(buf);
         setTypeAdd(set, s);
+        sdsfree(s);
     }
 
     /* Should have converted to hashtable */
@@ -734,4 +740,3 @@ TEST_F(SetTrackingTest, EmptySetZeroBytes) {
 
     decrRefCount(set);
 }
-
