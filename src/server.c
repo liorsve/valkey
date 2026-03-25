@@ -615,11 +615,19 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
+/* Return the logical size of an SDS entry: header + content + null terminator. */
+size_t sdsEntryGetSize(const void *entry) {
+    const_sds s = (const_sds)entry;
+    return sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+}
+
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = dictSdsDestructor,
+    .entryGetSize = sdsEntryGetSize
+};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;

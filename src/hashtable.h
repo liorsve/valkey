@@ -75,6 +75,9 @@ typedef struct {
      * number when the hashtable allocates some memory and with a negative number
      * when freeing. */
     void (*trackMemUsage)(hashtable *ht, ssize_t delta);
+    /* Return the logical size of an entry, for incremental data-bytes tracking.
+     * If set, the hashtable maintains tracked_data_bytes automatically. */
+    size_t (*entryGetSize)(const void *entry);
     /* Allow a hashtable to carry extra caller-defined metadata. The extra memory
      * is initialized to 0. */
     size_t (*getMetadataSize)(void);
@@ -126,6 +129,7 @@ size_t hashtableBuckets(hashtable *ht);
 size_t hashtableChainedBuckets(hashtable *ht, int table);
 unsigned hashtableEntriesPerBucket(void);
 size_t hashtableMemUsage(const hashtable *ht);
+size_t hashtableTrackedDataBytes(hashtable *ht);
 void hashtablePauseAutoShrink(hashtable *ht);
 void hashtableResumeAutoShrink(hashtable *ht);
 bool hashtableIsRehashing(hashtable *ht);
