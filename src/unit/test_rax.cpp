@@ -45,7 +45,10 @@
 
 extern "C" {
 #include "mt19937-64.c"
+#include "listpack.h"
 #include "rax.h"
+#include "sds.h"
+#include "stream.h"
 #include "util.h"
 
 extern bool accurate;
@@ -1027,3 +1030,375 @@ TEST_F(RaxTest, DISABLED_raxRecompressHugeKey) {
     zfree(large_key);
     raxFree(rt);
 }
+
+/* ── Parameterized data tracking tests ─────────────────────────────────
+ * Each test runs with every rax data type: listpack, streamNACK,
+ * streamCG, and streamConsumer. */
+
+struct RaxDataOps {
+    const char *name;
+    void *(*create)(int variant);
+    size_t (*getSize)(void *data);
+    void (*freeData)(void *data);
+};
+
+/* Listpack: variable size based on variant (number of entries). */
+static void *lpCreate(int variant) {
+    unsigned char *lp = lpNew(0);
+    char buf[64];
+    for (int i = 0; i < 1 + variant; i++) {
+        int n = snprintf(buf, sizeof(buf), "entry_%d_%d", variant, i);
+        lp = lpAppend(lp, (unsigned char *)buf, n);
+    }
+    return lp;
+}
+
+static size_t lpGetSize(void *data) {
+    return lpBytes((unsigned char *)data);
+}
+
+static void lpFreeData(void *data) {
+    lpFree((unsigned char *)data);
+}
+
+/* streamNACK: fixed size. */
+static void *nackCreate(int variant) {
+    streamNACK *nack = (streamNACK *)zcalloc(sizeof(*nack));
+    nack->delivery_count = (uint64_t)variant;
+    return nack;
+}
+
+static size_t nackGetSize(void *data) {
+    (void)data;
+    return sizeof(streamNACK);
+}
+
+/* streamCG: fixed size (sub-rax trees are separate allocations). */
+static void *cgCreate(int variant) {
+    streamCG *cg = (streamCG *)zcalloc(sizeof(*cg));
+    cg->entries_read = variant;
+    return cg;
+}
+
+static size_t cgGetSize(void *data) {
+    (void)data;
+    return sizeof(streamCG);
+}
+
+/* streamConsumer: variable size via sds name. */
+static void *consumerCreate(int variant) {
+    streamConsumer *sc = (streamConsumer *)zcalloc(sizeof(*sc));
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "consumer_%0*d", 5 + variant, variant);
+    sc->name = sdsnewlen(buf, len);
+    sc->pel = NULL;
+    return sc;
+}
+
+static size_t consumerGetSize(void *data) {
+    streamConsumer *sc = (streamConsumer *)data;
+    return sizeof(streamConsumer) + sdsReqSize(sdslen(sc->name), sdsType(sc->name));
+}
+
+static void consumerFreeData(void *data) {
+    streamConsumer *sc = (streamConsumer *)data;
+    sdsfree(sc->name);
+    zfree(sc);
+}
+
+static const RaxDataOps allDataOps[] = {
+    {"Listpack", lpCreate, lpGetSize, lpFreeData},
+    {"streamNACK", nackCreate, nackGetSize, zfree},
+    {"streamCG", cgCreate, cgGetSize, zfree},
+    {"streamConsumer", consumerCreate, consumerGetSize, consumerFreeData},
+};
+
+class RaxDataTrackingTest : public ::testing::TestWithParam<RaxDataOps> {};
+
+/* Ground truth: walk all keys and sum dataGetSize. */
+static size_t computeExpectedDataBytes(rax *rt) {
+    size_t total = 0;
+    raxIterator ri;
+    raxStart(&ri, rt);
+    raxSeek(&ri, "^", nullptr, 0);
+    while (raxNext(&ri)) {
+        if (ri.data && rt->dataGetSize) {
+            total += rt->dataGetSize(ri.data);
+        }
+    }
+    raxStop(&ri);
+    return total;
+}
+
+#define ASSERT_TRACKED_CORRECT(rt)                                   \
+    do {                                                             \
+        size_t _expected = computeExpectedDataBytes(rt);             \
+        ASSERT_EQ(raxTrackedDataBytes(rt), _expected)                \
+            << "tracked_data_bytes mismatch";                        \
+    } while (0)
+
+/* ── 1. Basic insert and track ────────────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, Insert) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    for (int i = 0; i < 100; i++) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "key:%d", i);
+        raxInsert(rt, (unsigned char *)key, len, ops.create(i % 10), nullptr);
+        ASSERT_TRACKED_CORRECT(rt);
+    }
+
+    raxFreeWithCallback(rt, ops.freeData);
+}
+
+/* ── 2. Insert then remove ────────────────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, Remove) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    for (int i = 0; i < 50; i++) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "entry:%d", i);
+        raxInsert(rt, (unsigned char *)key, len, ops.create(3), nullptr);
+    }
+    ASSERT_TRACKED_CORRECT(rt);
+
+    for (int i = 0; i < 50; i++) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "entry:%d", i);
+        void *old = nullptr;
+        raxRemove(rt, (unsigned char *)key, len, &old);
+        ops.freeData(old);
+        ASSERT_TRACKED_CORRECT(rt);
+    }
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    raxFree(rt);
+}
+
+/* ── 3. Overwrite (replace data) ──────────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, Overwrite) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    char key[] = "mykey";
+    void *d1 = ops.create(1);
+    size_t sz1 = ops.getSize(d1);
+    raxInsert(rt, (unsigned char *)key, 5, d1, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz1);
+
+    /* Overwrite with different variant */
+    void *old = nullptr;
+    void *d2 = ops.create(8);
+    size_t sz2 = ops.getSize(d2);
+    raxInsert(rt, (unsigned char *)key, 5, d2, &old);
+    ops.freeData(old);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz2);
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Overwrite again */
+    void *d3 = ops.create(0);
+    size_t sz3 = ops.getSize(d3);
+    raxInsert(rt, (unsigned char *)key, 5, d3, &old);
+    ops.freeData(old);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz3);
+    ASSERT_TRACKED_CORRECT(rt);
+
+    raxFreeWithCallback(rt, ops.freeData);
+}
+
+/* ── 4. TryInsert (no overwrite on existing) ──────────────────────────── */
+TEST_P(RaxDataTrackingTest, TryInsert) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    char key[] = "existing";
+    void *d1 = ops.create(2);
+    size_t sz1 = ops.getSize(d1);
+    raxInsert(rt, (unsigned char *)key, 8, d1, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz1);
+
+    /* TryInsert should not replace, tracked bytes unchanged */
+    void *d2 = ops.create(9);
+    int inserted = raxTryInsert(rt, (unsigned char *)key, 8, d2, nullptr);
+    ASSERT_EQ(inserted, 0);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz1);
+    ops.freeData(d2);
+
+    raxFreeWithCallback(rt, ops.freeData);
+}
+
+/* ── 5. No callback = no tracking ─────────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, NoCallback) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+
+    char key[] = "test";
+    raxInsert(rt, (unsigned char *)key, 4, ops.create(1), nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    void *old = nullptr;
+    raxRemove(rt, (unsigned char *)key, 4, &old);
+    ops.freeData(old);
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    raxFree(rt);
+}
+
+/* ── 6. Mixed insert/remove/overwrite ─────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, Mixed) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    for (int i = 0; i < 200; i++) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "k:%06d", i);
+        raxInsert(rt, (unsigned char *)key, len, ops.create(i % 10), nullptr);
+    }
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Remove odd keys */
+    for (int i = 1; i < 200; i += 2) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "k:%06d", i);
+        void *old = nullptr;
+        raxRemove(rt, (unsigned char *)key, len, &old);
+        ops.freeData(old);
+    }
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Overwrite even keys */
+    for (int i = 0; i < 200; i += 2) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "k:%06d", i);
+        void *old = nullptr;
+        raxInsert(rt, (unsigned char *)key, len, ops.create(5), &old);
+        ops.freeData(old);
+    }
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Remove all remaining */
+    for (int i = 0; i < 200; i += 2) {
+        char key[32];
+        int len = snprintf(key, sizeof(key), "k:%06d", i);
+        void *old = nullptr;
+        raxRemove(rt, (unsigned char *)key, len, &old);
+        ops.freeData(old);
+    }
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    raxFree(rt);
+}
+
+/* ── 7. Compressed node split — ALGO 1 (character mismatch) ──────────── */
+TEST_P(RaxDataTrackingTest, CompressedNodesAlgo1) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    /* "foobar" creates a compressed node. "footer" splits it at
+     * position 3 ('b' vs 't'). This exercises Algorithm 1. */
+    raxInsert(rt, (unsigned char *)"foobar", 6, ops.create(2), nullptr);
+    ASSERT_TRACKED_CORRECT(rt);
+    raxInsert(rt, (unsigned char *)"footer", 6, ops.create(3), nullptr);
+    ASSERT_TRACKED_CORRECT(rt);
+    raxInsert(rt, (unsigned char *)"foo", 3, ops.create(1), nullptr);
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Remove triggers recompression */
+    void *old = nullptr;
+    raxRemove(rt, (unsigned char *)"foo", 3, &old);
+    ops.freeData(old);
+    ASSERT_TRACKED_CORRECT(rt);
+
+    raxFreeWithCallback(rt, ops.freeData);
+}
+
+/* ── 8. Algorithm 2: insert prefix of existing compressed key ─────────── */
+TEST_P(RaxDataTrackingTest, CompressedNodesAlgo2) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    void *d1 = ops.create(2);
+    size_t sz1 = ops.getSize(d1);
+    raxInsert(rt, (unsigned char *)"ANNIBALE", 8, d1, nullptr);
+    ASSERT_TRACKED_CORRECT(rt);
+
+    /* Insert "ANNI" — a prefix that triggers Algorithm 2. */
+    void *d2 = ops.create(4);
+    size_t sz2 = ops.getSize(d2);
+    raxInsert(rt, (unsigned char *)"ANNI", 4, d2, nullptr);
+    ASSERT_TRACKED_CORRECT(rt);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz1 + sz2);
+
+    /* Overwrite the prefix key */
+    void *old = nullptr;
+    void *d3 = ops.create(0);
+    size_t sz3 = ops.getSize(d3);
+    raxInsert(rt, (unsigned char *)"ANNI", 4, d3, &old);
+    ops.freeData(old);
+    ASSERT_TRACKED_CORRECT(rt);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz1 + sz3);
+
+    /* Remove both */
+    raxRemove(rt, (unsigned char *)"ANNI", 4, &old);
+    ops.freeData(old);
+    ASSERT_TRACKED_CORRECT(rt);
+    raxRemove(rt, (unsigned char *)"ANNIBALE", 8, &old);
+    ops.freeData(old);
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    raxFree(rt);
+}
+
+/* ── 9. NULL data (isnull nodes) ──────────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, NullData) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    raxInsert(rt, (unsigned char *)"nullkey", 7, nullptr, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    void *d = ops.create(2);
+    size_t sz = ops.getSize(d);
+    raxInsert(rt, (unsigned char *)"realkey", 7, d, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz);
+
+    raxRemove(rt, (unsigned char *)"nullkey", 7, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz);
+
+    raxFreeWithCallback(rt, ops.freeData);
+}
+
+/* ── 10. Overwrite non-null with NULL ─────────────────────────────────── */
+TEST_P(RaxDataTrackingTest, OverwriteWithNull) {
+    auto ops = GetParam();
+    rax *rt = raxNew();
+    raxSetDataGetSize(rt, ops.getSize);
+
+    void *d = ops.create(3);
+    size_t sz = ops.getSize(d);
+    raxInsert(rt, (unsigned char *)"key", 3, d, nullptr);
+    ASSERT_EQ(raxTrackedDataBytes(rt), sz);
+
+    void *old = nullptr;
+    raxInsert(rt, (unsigned char *)"key", 3, nullptr, &old);
+    ops.freeData(old);
+    ASSERT_EQ(raxTrackedDataBytes(rt), 0ul);
+
+    raxFree(rt);
+}
+
+static std::string raxDataOpsName(const ::testing::TestParamInfo<RaxDataOps> &info) {
+    return info.param.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(AllDataTypes, RaxDataTrackingTest, ::testing::ValuesIn(allDataOps), raxDataOpsName);

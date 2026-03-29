@@ -191,6 +191,8 @@ rax *raxNew(void) {
     if (rax == NULL) return NULL;
     rax->numele = 0;
     rax->numnodes = 1;
+    rax->tracked_data_bytes = 0;
+    rax->dataGetSize = NULL;
     rax->head = raxNewNode(0, 0);
     rax->alloc_size = rax_ptr_alloc_size(rax) + rax_ptr_alloc_size(rax->head);
     if (rax->head == NULL) {
@@ -526,7 +528,17 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Update the existing key if there is already one. */
         if (h->iskey) {
             if (old) *old = raxGetData(h);
-            if (overwrite) raxSetData(h, data);
+            if (overwrite) {
+                /* Track the data size delta only when old is requested (genuine
+                 * replacement). When old is NULL the caller is just updating the
+                 * pointer (e.g. after realloc) and handles tracking itself via
+                 * raxAdjustTrackedDataBytes. */
+                if (rax->dataGetSize && old) {
+                    if (!h->isnull) rax->tracked_data_bytes -= rax->dataGetSize(raxGetData(h));
+                    if (data) rax->tracked_data_bytes += rax->dataGetSize(data);
+                }
+                raxSetData(h, data);
+            }
             errno = 0;
             return 0; /* Element already exists. */
         }
@@ -534,6 +546,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Otherwise set the node as a key. Note that raxSetData()
          * will set h->iskey. */
         raxSetData(h, data);
+        if (rax->dataGetSize && data) rax->tracked_data_bytes += rax->dataGetSize(data);
         rax->numele++;
         return 1; /* Element inserted. */
     }
@@ -800,6 +813,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         postfix->isnull = 0;
         memcpy(postfix->data, h->data + j, postfixlen);
         raxSetData(postfix, data);
+        if (rax->dataGetSize && data) rax->tracked_data_bytes += rax->dataGetSize(data);
         raxNode **cp = raxNodeLastChildPtr(postfix);
         memcpy(cp, &next, sizeof(next));
         rax->numnodes++;
@@ -870,6 +884,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
     h = newh;
     if (!h->iskey) rax->numele++;
     raxSetData(h, data);
+    if (rax->dataGetSize && data) rax->tracked_data_bytes += rax->dataGetSize(data);
     memcpy(parentlink, &h, sizeof(h));
     rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h);
     return 1; /* Element inserted. */
@@ -1022,6 +1037,10 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
+    /* Track data removal only when old is requested (data pointer is valid).
+     * When old is NULL the caller already handled tracking manually and may
+     * have freed the data, so calling dataGetSize would be unsafe. */
+    if (rax->dataGetSize && old && !h->isnull) rax->tracked_data_bytes -= rax->dataGetSize(raxGetData(h));
     h->iskey = 0;
     rax->numele--;
 
@@ -1789,6 +1808,22 @@ uint64_t raxSize(rax *rax) {
 /* Return the rax tree allocation size in bytes */
 size_t raxAllocSize(rax *rax) {
     return rax->alloc_size;
+}
+
+/* Return the sum of dataGetSize() for all key data, maintained incrementally. */
+size_t raxTrackedDataBytes(rax *rax) {
+    return rax->tracked_data_bytes;
+}
+
+/* Set the dataGetSize callback for incremental data-bytes tracking. */
+void raxSetDataGetSize(rax *rax, size_t (*dataGetSize)(void *data)) {
+    rax->dataGetSize = dataGetSize;
+}
+
+/* Adjust tracked_data_bytes by delta. Use when data is modified in-place
+ * (e.g., a listpack grows via lpAppend) without going through raxInsert. */
+void raxAdjustTrackedDataBytes(rax *rax, int64_t delta) {
+    rax->tracked_data_bytes += delta;
 }
 
 /* ----------------------------- Introspection ------------------------------ */

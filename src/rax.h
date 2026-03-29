@@ -135,6 +135,11 @@ typedef struct rax {
     uint64_t numele;   /* Number of keys in the tree */
     uint64_t numnodes; /* Number of rax nodes in the tree */
     size_t alloc_size; /* Total allocation size of the tree in bytes */
+    size_t tracked_data_bytes; /* Sum of dataGetSize() for all key data, maintained
+                                * automatically when dataGetSize is set. */
+    size_t (*dataGetSize)(void *data); /* Optional callback returning the logical
+                                        * size of the data stored at a key node.
+                                        * If NULL, tracked_data_bytes is not maintained. */
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -205,6 +210,9 @@ int raxEOF(raxIterator *it);
 void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 size_t raxAllocSize(rax *rax);
+size_t raxTrackedDataBytes(rax *rax);
+void raxSetDataGetSize(rax *rax, size_t (*dataGetSize)(void *data));
+void raxAdjustTrackedDataBytes(rax *rax, int64_t delta);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
 
