@@ -529,11 +529,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         if (h->iskey) {
             if (old) *old = raxGetData(h);
             if (overwrite) {
-                /* Track the data size delta only when old is requested (genuine
-                 * replacement). When old is NULL the caller is just updating the
-                 * pointer (e.g. after realloc) and handles tracking itself via
-                 * raxAdjustTrackedDataBytes. */
-                if (rax->dataGetSize && old) {
+                if (rax->dataGetSize) {
                     if (!h->isnull) rax->tracked_data_bytes -= rax->dataGetSize(raxGetData(h));
                     if (data) rax->tracked_data_bytes += rax->dataGetSize(data);
                 }
@@ -932,6 +928,20 @@ int raxFind(rax *rax, unsigned char *s, size_t len, void **value) {
     return 1;
 }
 
+/* Update the data pointer for an existing key without affecting
+ * tracked_data_bytes. Use when data was modified in-place and the pointer
+ * may have moved due to realloc. The caller should use
+ * raxAdjustTrackedDataBytes to account for any size change.
+ * Returns 1 if found and updated, 0 if not found. */
+int raxUpdateData(rax *rax, unsigned char *s, size_t len, void *data) {
+    raxNode *h;
+    int splitpos = 0;
+    size_t i = raxLowWalk(rax, s, len, &h, NULL, &splitpos, NULL);
+    if (i != len || (h->iscompr && splitpos != 0) || !h->iskey) return 0;
+    raxSetData(h, data);
+    return 1;
+}
+
 /* Return the memory address where the 'parent' node stores the specified
  * 'child' pointer, so that the caller can update the pointer with another
  * one if needed. The function assumes it will find a match, otherwise the
@@ -1037,10 +1047,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
-    /* Track data removal only when old is requested (data pointer is valid).
-     * When old is NULL the caller already handled tracking manually and may
-     * have freed the data, so calling dataGetSize would be unsafe. */
-    if (rax->dataGetSize && old && !h->isnull) rax->tracked_data_bytes -= rax->dataGetSize(raxGetData(h));
+    if (rax->dataGetSize && !h->isnull) rax->tracked_data_bytes -= rax->dataGetSize(raxGetData(h));
     h->iskey = 0;
     rax->numele--;
 

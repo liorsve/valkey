@@ -553,7 +553,7 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         if (new_node) {
             /* Shrink extra pre-allocated memory */
             lp = lpShrinkToFit(lp);
-            if (ri.data != lp) raxInsert(s->rax, ri.key, ri.key_len, lp, NULL);
+            if (ri.data != lp) raxUpdateData(s->rax, ri.key, ri.key_len, lp);
             lp = NULL;
         }
     }
@@ -663,11 +663,10 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     }
     lp = lpAppendInteger(lp, lp_count);
 
-    /* Insert back into the tree in order to update the listpack pointer.
-     * Adjust tracked data bytes for the in-place growth delta. For new
-     * listpacks, lp_old_bytes was captured after the initial raxInsert. */
+    /* Update the rax pointer and tracked data bytes. raxUpdateData bypasses
+     * tracking (old pointer may be stale after realloc); we adjust manually. */
     raxAdjustTrackedDataBytes(s->rax, (int64_t)lpBytes(lp) - (int64_t)lp_old_bytes);
-    if (ri.data != lp) raxInsert(s->rax, (unsigned char *)&rax_key, sizeof(rax_key), lp, NULL);
+    if (ri.data != lp) raxUpdateData(s->rax, (unsigned char *)&rax_key, sizeof(rax_key), lp);
     s->length++;
     s->entries_added++;
     s->last_id = id;
@@ -765,9 +764,8 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         }
 
         if (remove_node) {
-            raxAdjustTrackedDataBytes(s->rax, -(int64_t)lpBytes(lp));
-            lpFree(lp);
             raxRemove(s->rax, ri.key, ri.key_len, NULL);
+            lpFree(lp);
             raxSeek(&ri, ">=", ri.key, ri.key_len);
             s->length -= entries;
             deleted += entries;
@@ -865,7 +863,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
 
         /* Update the listpack with the new pointer. */
         raxAdjustTrackedDataBytes(s->rax, (int64_t)lpBytes(lp) - (int64_t)lp_before_trim);
-        if (ri.data != lp) raxInsert(s->rax, ri.key, ri.key_len, lp, NULL);
+        if (ri.data != lp) raxUpdateData(s->rax, ri.key, ri.key_len, lp);
 
         break; /* If we are here, there was enough to delete in the current
                   node, so no need to go to the next node. */
@@ -1292,11 +1290,9 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
     if (aux == 1) {
         /* If this is the last element in the listpack, we can remove the whole
-         * node. Manually adjust tracking before removal since raxRemove with
-         * old=NULL skips auto-tracking. */
-        raxAdjustTrackedDataBytes(si->stream->rax, -(int64_t)lp_before);
-        lpFree(lp);
+         * node. raxRemove auto-tracks the subtraction via dataGetSize. */
         raxRemove(si->stream->rax, si->ri.key, si->ri.key_len, NULL);
+        lpFree(lp);
     } else {
         /* In the base case we alter the counters of valid/deleted entries. */
         lp = lpReplaceInteger(lp, &p, aux - 1);
@@ -1306,7 +1302,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
         /* Update the listpack with the new pointer. */
         raxAdjustTrackedDataBytes(si->stream->rax, (int64_t)lpBytes(lp) - (int64_t)lp_before);
-        if (si->lp != lp) raxInsert(si->stream->rax, si->ri.key, si->ri.key_len, lp, NULL);
+        if (si->lp != lp) raxUpdateData(si->stream->rax, si->ri.key, si->ri.key_len, lp);
     }
 
     /* Update the number of entries counter. */
@@ -2589,14 +2585,12 @@ void streamDelConsumer(streamCG *cg, streamConsumer *consumer) {
     raxSeek(&ri, "^", NULL, 0);
     while (raxNext(&ri)) {
         streamNACK *nack = ri.data;
-        raxAdjustTrackedDataBytes(cg->pel, -(int64_t)sizeof(streamNACK));
         raxRemove(cg->pel, ri.key, ri.key_len, NULL);
         streamFreeNACK(nack);
     }
     raxStop(&ri);
 
     /* Deallocate the consumer. */
-    raxAdjustTrackedDataBytes(cg->consumers, -(int64_t)streamConsumerGetSize(consumer));
     raxRemove(cg->consumers, (unsigned char *)consumer->name, sdslen(consumer->name), NULL);
     streamFreeConsumer(consumer);
 }
@@ -2736,7 +2730,6 @@ void xgroupCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(opt, "DESTROY") && c->argc == 4) {
         if (cg) {
-            raxAdjustTrackedDataBytes(s->cgroups, -(int64_t)sizeof(streamCG));
             raxRemove(s->cgroups, (unsigned char *)grpname, sdslen(grpname), NULL);
             streamFreeCG(cg);
             server.dirty++;
@@ -2884,7 +2877,6 @@ void xackCommand(client *c) {
         void *result;
         if (raxFind(group->pel, buf, sizeof(buf), &result)) {
             streamNACK *nack = result;
-            raxAdjustTrackedDataBytes(group->pel, -(int64_t)sizeof(streamNACK));
             raxRemove(group->pel, buf, sizeof(buf), NULL);
             raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
             streamFreeNACK(nack);
@@ -3269,7 +3261,6 @@ void xclaimCommand(client *c) {
                 propagate_last_id = 0; /* Will be propagated by XCLAIM itself. */
                 server.dirty++;
                 /* Release the NACK */
-                raxAdjustTrackedDataBytes(group->pel, -(int64_t)sizeof(streamNACK));
                 raxRemove(group->pel, buf, sizeof(buf), NULL);
                 raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
                 streamFreeNACK(nack);
@@ -3456,7 +3447,6 @@ void xautoclaimCommand(client *c) {
             decrRefCount(idstr);
             server.dirty++;
             /* Clear this entry from the PEL, it no longer exists */
-            raxAdjustTrackedDataBytes(group->pel, -(int64_t)sizeof(streamNACK));
             raxRemove(group->pel, ri.key, ri.key_len, NULL);
             raxRemove(nack->consumer->pel, ri.key, ri.key_len, NULL);
             streamFreeNACK(nack);

@@ -312,7 +312,6 @@ TEST_F(StreamRaxTrackingTest, AckRemovesNACK) {
         raxFind(cg->pel, buf, sizeof(buf), &result);
         streamNACK *nack = (streamNACK *)result;
 
-        raxAdjustTrackedDataBytes(cg->pel, -(int64_t)sizeof(streamNACK));
         raxRemove(cg->pel, buf, sizeof(buf), NULL);
         raxRemove(consumer->pel, buf, sizeof(buf), NULL);
         streamFreeNACK(nack);
@@ -339,7 +338,6 @@ TEST_F(StreamRaxTrackingTest, DestroyConsumerGroup) {
     void *result;
     raxFind(s->cgroups, (unsigned char *)"grp2", 4, &result);
     streamCG *cg = (streamCG *)result;
-    raxAdjustTrackedDataBytes(s->cgroups, -(int64_t)sizeof(streamCG));
     raxRemove(s->cgroups, (unsigned char *)"grp2", 4, NULL);
     streamFreeCG(cg);
 
