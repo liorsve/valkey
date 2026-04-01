@@ -162,5 +162,8 @@ long long streamEstimateDistanceFromFirstEverEntry(stream *s, streamID *id);
 int64_t streamTrimByLength(stream *s, long long maxlen, int approx);
 int64_t streamTrimByID(stream *s, streamID minid, int approx);
 int streamVerifyTracking(stream *s, char *errmsg, size_t errlen);
+void streamFreeNACKWithTracking(void *data, void *ctx);
+void streamFreeConsumerWithTracking(void *data, void *ctx);
+void streamFreeCGWithTracking(void *data, void *ctx);
 
 #endif
