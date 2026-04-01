@@ -39,6 +39,7 @@
 #include "io_threads.h"
 #include "sds.h"
 #include "module.h"
+#include "stream.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -898,6 +899,18 @@ void debugCommand(client *c) {
             addReplyError(c, "argument must be a memory value bigger than 1 and smaller than 4gb");
         } else {
             addReply(c, shared.ok);
+        }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "stream-verify-tracking") && c->argc == 3) {
+        robj *o = lookupKeyRead(c->db, c->argv[2]);
+        if (o == NULL || o->type != OBJ_STREAM) {
+            addReplyError(c, "No such stream key");
+        } else {
+            char errmsg[256];
+            if (streamVerifyTracking(objectGetVal(o), errmsg, sizeof(errmsg))) {
+                addReply(c, shared.ok);
+            } else {
+                addReplyError(c, errmsg);
+            }
         }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-skip-checksum-validation") && c->argc == 3) {
         server.skip_checksum_validation = atoi(objectGetVal(c->argv[2]));

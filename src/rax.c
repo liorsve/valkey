@@ -1256,6 +1256,33 @@ void raxFreeWithCallback(rax *rax, void (*free_callback)(void *)) {
     rax_free(rax);
 }
 
+/* Same as raxRecursiveFree but the callback receives a context pointer. */
+static void raxRecursiveFreeWithContext(rax *rax, raxNode *n,
+                                        void (*free_callback)(void *data, void *ctx), void *ctx) {
+    debugnode("free traversing", n);
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeLastChildPtr(n);
+    while (numchildren--) {
+        raxNode *child;
+        memcpy(&child, cp, sizeof(child));
+        raxRecursiveFreeWithContext(rax, child, free_callback, ctx);
+        cp--;
+    }
+    debugnode("free depth-first", n);
+    if (free_callback && n->iskey && !n->isnull) free_callback(raxGetData(n), ctx);
+    rax_free(n);
+    rax->numnodes--;
+}
+
+/* Free a whole radix tree. For each data item, call free_callback with the
+ * data and the provided context pointer. This allows the callback to access
+ * an owning structure (e.g., stream *) for memory tracking during cleanup. */
+void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx) {
+    raxRecursiveFreeWithContext(rax, rax->head, free_callback, ctx);
+    assert(rax->numnodes == 0);
+    rax_free(rax);
+}
+
 /* Free a whole radix tree. */
 void raxFree(rax *rax) {
     raxFreeWithCallback(rax, NULL);
