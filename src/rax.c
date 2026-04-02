@@ -194,6 +194,8 @@ rax *raxNew(void) {
     rax->head = raxNewNode(0, 0);
     rax->alloc_size = rax_ptr_alloc_size(rax) + rax_ptr_alloc_size(rax->head);
     rax->external_logical_size = NULL;
+    rax->dataGetSize = NULL;
+    rax->external_tracked_data = NULL;
     if (rax->head == NULL) {
         rax_free(rax);
         return NULL;
@@ -211,9 +213,35 @@ void raxSetExternalLogicalSize(rax *rax, size_t *ptr) {
     if (ptr) *ptr += sizeof(*rax) + raxNodeCurrentLength(rax->head);
 }
 
+/* Set data tracking callback and external pointer. The callback returns the
+ * logical size of the data payload. It is called on new key insert, remove,
+ * and recursive free. NOT called on overwrite (stale pointer risk). */
+void raxSetDataTracking(rax *rax, size_t (*dataGetSize)(void *data), size_t *ext_ptr) {
+    rax->dataGetSize = dataGetSize;
+    rax->external_tracked_data = ext_ptr;
+}
+
+/* Propagate a data size delta to the external tracked data counter.
+ * Used for in-place data mutations where no raxInsert/raxRemove fires. */
+void raxAdjustTrackedDataBytes(rax *rax, int64_t delta) {
+    if (rax->external_tracked_data) *rax->external_tracked_data += delta;
+}
+
 /* Propagate a logical size delta to the external counter, if set. */
 static inline void raxExternalDelta(rax *rax, int64_t delta) {
     if (rax->external_logical_size) *rax->external_logical_size += delta;
+}
+
+/* Track data insertion via callback. */
+static inline void raxTrackDataInsert(rax *rax, void *data) {
+    if (rax->dataGetSize && rax->external_tracked_data)
+        *rax->external_tracked_data += rax->dataGetSize(data);
+}
+
+/* Track data removal via callback. */
+static inline void raxTrackDataRemove(rax *rax, void *data) {
+    if (rax->dataGetSize && rax->external_tracked_data)
+        *rax->external_tracked_data -= rax->dataGetSize(data);
 }
 
 /* realloc the node to make room for auxiliary data in order
@@ -555,6 +583,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
          * logical length. The realloc delta above was computed before the
          * flags changed, so propagate the difference now. */
         raxExternalDelta(rax, sizeof(void *));
+        raxTrackDataInsert(rax, data);
         rax->numele++;
         return 1; /* Element inserted. */
     }
@@ -853,6 +882,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Finish! We don't need to continue with the insertion
          * algorithm for ALGO 2. The key is already inserted. */
         rax->numele++;
+        raxTrackDataInsert(rax, data);
         raxExternalDelta(rax, -(int64_t)raxNodeCurrentLength(h));
         rax->alloc_size -= rax_ptr_alloc_size(h);
         rax_free(h);
@@ -904,6 +934,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
     memcpy(parentlink, &h, sizeof(h));
     rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h);
     raxExternalDelta(rax, (int64_t)(raxNodeCurrentLength(h) - oldlogical));
+    raxTrackDataInsert(rax, data);
     return 1; /* Element inserted. */
 
 oom:
@@ -1054,7 +1085,10 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
-    if (!h->isnull) raxExternalDelta(rax, -(int64_t)sizeof(void *));
+    if (!h->isnull) {
+        raxTrackDataRemove(rax, raxGetData(h));
+        raxExternalDelta(rax, -(int64_t)sizeof(void *));
+    }
     h->iskey = 0;
     rax->numele--;
 
@@ -1262,7 +1296,10 @@ void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void *)) {
         cp--;
     }
     debugnode("free depth-first", n);
-    if (free_callback && n->iskey && !n->isnull) free_callback(raxGetData(n));
+    if (n->iskey && !n->isnull) {
+        raxTrackDataRemove(rax, raxGetData(n));
+        if (free_callback) free_callback(raxGetData(n));
+    }
     raxExternalDelta(rax, -(int64_t)raxNodeCurrentLength(n));
     rax_free(n);
     rax->numnodes--;
@@ -1279,7 +1316,7 @@ void raxFreeWithCallback(rax *rax, void (*free_callback)(void *)) {
 
 /* Same as raxRecursiveFree but the callback receives a context pointer. */
 static void raxRecursiveFreeWithContext(rax *rax, raxNode *n,
-                                        void (*in ctfree_callback)(void *data, void *ctx), void *ctx) {
+                                        void (*free_callback)(void *data, void *ctx), void *ctx) {
     debugnode("free traversing", n);
     int numchildren = n->iscompr ? 1 : n->size;
     raxNode **cp = raxNodeLastChildPtr(n);
@@ -1290,7 +1327,10 @@ static void raxRecursiveFreeWithContext(rax *rax, raxNode *n,
         cp--;
     }
     debugnode("free depth-first", n);
-    if (free_callback && n->iskey && !n->isnull) free_callback(raxGetData(n), ctx);
+    if (n->iskey && !n->isnull) {
+        raxTrackDataRemove(rax, raxGetData(n));
+        if (free_callback) free_callback(raxGetData(n), ctx);
+    }
     raxExternalDelta(rax, -(int64_t)raxNodeCurrentLength(n));
     rax_free(n);
     rax->numnodes--;
@@ -1874,7 +1914,7 @@ static size_t raxRecursiveLogicalSize(raxNode *n) {
     return total;
 }
 
-size_t raxLogicalSize(rax *rax) {
+size_t raxComputeLogicalSize(rax *rax) {
     return sizeof(*rax) + raxRecursiveLogicalSize(rax->head);
 }
 

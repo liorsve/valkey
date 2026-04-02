@@ -485,10 +485,8 @@ TEST_F(VsetTest, TestVsetFuzzer) {
 #define ASSERT_VSET_TRACKING(set)                                          \
     do {                                                                   \
         char errmsg[256];                                                  \
-        if (!vsetVerifyTracking(set, errmsg, sizeof(errmsg))) {            \
-            TEST_PRINT_ERROR(errmsg);                                      \
-            return 1;                                                      \
-        }                                                                  \
+        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg)))       \
+            << errmsg;                                                     \
     } while (0)
 
 /* Force promotion to RAX by inserting enough entries with spread expiries */
@@ -498,8 +496,7 @@ static void fillToRax(vset *set, int count, long long base_expiry) {
     }
 }
 
-int test_vset_tracking_add_to_rax(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingAddToRax) {
     vset set;
     vsetInit(&set);
 
@@ -512,12 +509,9 @@ int test_vset_tracking_add_to_rax(int argc, char **argv, int flags) {
     }
 
     vsetClear(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_remove(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingRemoveFromRax) {
     vset set;
     vsetInit(&set);
 
@@ -530,12 +524,9 @@ int test_vset_tracking_remove(int argc, char **argv, int flags) {
     }
 
     vsetRelease(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_expire(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingExpireFromRax) {
     vset set;
     vsetInit(&set);
 
@@ -549,12 +540,9 @@ int test_vset_tracking_expire(int argc, char **argv, int flags) {
 
     expire_mock_entries(&set, LONG_LONG_MAX);
     vsetRelease(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_update(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingUpdateInRax) {
     vset set;
     vsetInit(&set);
 
@@ -567,12 +555,9 @@ int test_vset_tracking_update(int argc, char **argv, int flags) {
     }
 
     vsetClear(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_same_bucket_promotion(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingSameBucketPromotion) {
     vset set;
     vsetInit(&set);
 
@@ -588,12 +573,9 @@ int test_vset_tracking_same_bucket_promotion(int argc, char **argv, int flags) {
     }
 
     vsetClear(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_vector_to_hashtable(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingVectorToHashtable) {
     vset set;
     vsetInit(&set);
 
@@ -610,19 +592,16 @@ int test_vset_tracking_vector_to_hashtable(int argc, char **argv, int flags) {
     }
 
     vsetClear(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_defrag(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingDefrag) {
     vset set;
     vsetInit(&set);
 
     fillToRax(&set, 200, 1000);
     ASSERT_VSET_TRACKING(&set);
 
-    TEST_ASSERT(defrag_vset(&set, 0, 0) == 0);
+    ASSERT_EQ(defrag_vset(&set, 0, 0), 0u);
     ASSERT_VSET_TRACKING(&set);
 
     for (int i = 0; i < 50; i++) {
@@ -631,12 +610,9 @@ int test_vset_tracking_defrag(int argc, char **argv, int flags) {
     ASSERT_VSET_TRACKING(&set);
 
     vsetClear(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_shrink(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
+TEST_F(VsetTest, TrackingShrinkFromRax) {
     vset set;
     vsetInit(&set);
 
@@ -649,13 +625,10 @@ int test_vset_tracking_shrink(int argc, char **argv, int flags) {
     }
 
     vsetRelease(&set);
-    free_mock_entries();
-    return 0;
 }
 
-int test_vset_tracking_fuzzer(int argc, char **argv, int flags) {
-    UNUSED(argc); UNUSED(argv); UNUSED(flags);
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
+TEST_F(VsetTest, TrackingFuzzer) {
+    unsigned seed = static_cast<unsigned>(time(nullptr)) ^ static_cast<unsigned>(getpid());
     srand(seed);
     printf("  Vset tracking fuzzer seed: %u\n", seed);
 
@@ -690,6 +663,4 @@ int test_vset_tracking_fuzzer(int argc, char **argv, int flags) {
 
     expire_mock_entries(&set, LONG_LONG_MAX);
     vsetRelease(&set);
-    free_mock_entries();
-    return 0;
 }

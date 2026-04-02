@@ -140,6 +140,13 @@ typedef struct rax {
                                     * propagated here on every mutation.
                                     * Allows multiple rax trees to aggregate
                                     * their overhead into one counter. */
+    size_t (*dataGetSize)(void *data); /* If non-NULL, called on new key insert,
+                                        * remove, and recursive free to compute
+                                        * data payload size. NOT called on
+                                        * overwrite (stale pointer risk). */
+    size_t *external_tracked_data;     /* Destination for dataGetSize deltas and
+                                        * manual adjustments via
+                                        * raxAdjustTrackedDataBytes. */
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -210,8 +217,10 @@ int raxEOF(raxIterator *it);
 void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 size_t raxAllocSize(rax *rax);
-size_t raxLogicalSize(rax *rax);
+size_t raxComputeLogicalSize(rax *rax);
 void raxSetExternalLogicalSize(rax *rax, size_t *ptr);
+void raxSetDataTracking(rax *rax, size_t (*dataGetSize)(void *data), size_t *ext_ptr);
+void raxAdjustTrackedDataBytes(rax *rax, int64_t delta);
 void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
