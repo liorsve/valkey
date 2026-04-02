@@ -551,6 +551,10 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Otherwise set the node as a key. Note that raxSetData()
          * will set h->iskey. */
         raxSetData(h, data);
+        /* raxSetData sets iskey=1/isnull=0, adding sizeof(void*) to the
+         * logical length. The realloc delta above was computed before the
+         * flags changed, so propagate the difference now. */
+        raxExternalDelta(rax, sizeof(void *));
         rax->numele++;
         return 1; /* Element inserted. */
     }
@@ -1050,6 +1054,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
+    if (!h->isnull) raxExternalDelta(rax, -(int64_t)sizeof(void *));
     h->iskey = 0;
     rax->numele--;
 
@@ -1274,7 +1279,7 @@ void raxFreeWithCallback(rax *rax, void (*free_callback)(void *)) {
 
 /* Same as raxRecursiveFree but the callback receives a context pointer. */
 static void raxRecursiveFreeWithContext(rax *rax, raxNode *n,
-                                        void (*free_callback)(void *data, void *ctx), void *ctx) {
+                                        void (*in ctfree_callback)(void *data, void *ctx), void *ctx) {
     debugnode("free traversing", n);
     int numchildren = n->iscompr ? 1 : n->size;
     raxNode **cp = raxNodeLastChildPtr(n);
@@ -1852,6 +1857,25 @@ uint64_t raxSize(rax *rax) {
 /* Return the rax tree allocation size in bytes */
 size_t raxAllocSize(rax *rax) {
     return rax->alloc_size;
+}
+
+/* Compute the total logical size of a rax tree by walking all nodes.
+ * O(n) — intended for testing/verification only. */
+static size_t raxRecursiveLogicalSize(raxNode *n) {
+    size_t total = raxNodeCurrentLength(n);
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeLastChildPtr(n);
+    while (numchildren--) {
+        raxNode *child;
+        memcpy(&child, cp, sizeof(child));
+        total += raxRecursiveLogicalSize(child);
+        cp--;
+    }
+    return total;
+}
+
+size_t raxLogicalSize(rax *rax) {
+    return sizeof(*rax) + raxRecursiveLogicalSize(rax->head);
 }
 
 /* ----------------------------- Introspection ------------------------------ */

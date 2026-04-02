@@ -22,9 +22,8 @@ typedef struct stream {
     streamID max_deleted_entry_id; /* The maximal ID that was deleted. */
     uint64_t entries_added;        /* All time count of elements added. */
     size_t tracked_data_bytes;     /* Listpack bytes + consumer name SDS bytes. */
-    size_t tracked_struct_bytes;   /* sizeof(streamCG/NACK/Consumer) for all structs. */
-    size_t tracked_rax_overhead;   /* Auto-aggregated rax logical size across ALL
-                                    * sub-rax trees via external_logical_size pointer. */
+    size_t tracked_overhead;       /* Rax node overhead (auto via external_logical_size)
+                                    * + sizeof(streamCG/NACK/Consumer) for all structs. */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without

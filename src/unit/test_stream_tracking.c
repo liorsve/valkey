@@ -3,8 +3,7 @@
  * All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Unit tests for stream tracked_data_bytes, tracked_struct_bytes,
- * and tracked_rax_overhead (Approach F: external pointer).
+ * Unit tests for stream tracked_data_bytes and tracked_overhead.
  */
 
 #include "../fmacros.h"
@@ -62,21 +61,27 @@ static size_t computeDataBytesWalk(stream *s) {
     return total;
 }
 
-static size_t computeStructBytesWalk(stream *s) {
+static size_t computeOverheadWalk(stream *s) {
     size_t total = 0;
+    total += raxLogicalSize(s->rax);
     if (s->cgroups) {
+        total += raxLogicalSize(s->cgroups);
         raxIterator ri;
         raxStart(&ri, s->cgroups);
         raxSeek(&ri, "^", NULL, 0);
         while (raxNext(&ri)) {
             streamCG *cg = ri.data;
             total += sizeof(streamCG);
+            total += raxLogicalSize(cg->pel);
             total += raxSize(cg->pel) * sizeof(streamNACK);
+            total += raxLogicalSize(cg->consumers);
             raxIterator ci;
             raxStart(&ci, cg->consumers);
             raxSeek(&ci, "^", NULL, 0);
             while (raxNext(&ci)) {
+                streamConsumer *sc = ci.data;
                 total += sizeof(streamConsumer);
+                total += raxLogicalSize(sc->pel);
             }
             raxStop(&ci);
         }
@@ -88,15 +93,16 @@ static size_t computeStructBytesWalk(stream *s) {
 #define ASSERT_STREAM_TRACKING(s)                                               \
     do {                                                                        \
         size_t wd = computeDataBytesWalk(s);                                    \
-        size_t ws = computeStructBytesWalk(s);                                  \
+        size_t wo = computeOverheadWalk(s);                                     \
         if ((s)->tracked_data_bytes != wd) {                                    \
-            printf("tracked_data_bytes mismatch: tracked=%zu walk=%zu\n",       \
-                   (s)->tracked_data_bytes, wd);                                \
+            fprintf(stderr, "tracked_data_bytes mismatch: tracked=%zu walk=%zu at %s:%d\n", \
+                   (s)->tracked_data_bytes, wd, __FILE__, __LINE__);            \
             TEST_ASSERT(0);                                                     \
         }                                                                       \
-        if ((s)->tracked_struct_bytes != ws) {                                  \
-            printf("tracked_struct_bytes mismatch: tracked=%zu walk=%zu\n",     \
-                   (s)->tracked_struct_bytes, ws);                              \
+        if ((s)->tracked_overhead != wo) {                                      \
+            fprintf(stderr, "tracked_overhead mismatch: tracked=%zu walk=%zu diff=%zd at %s:%d\n", \
+                   (s)->tracked_overhead, wo,                                   \
+                   (ssize_t)((s)->tracked_overhead - wo), __FILE__, __LINE__);  \
             TEST_ASSERT(0);                                                     \
         }                                                                       \
     } while (0)
@@ -278,15 +284,15 @@ int test_stream_tracking_full_lifecycle(int argc, char **argv, int flags) {
     sds name2 = sdsnew("bob_with_longer_name");
     streamConsumer *c1 = streamCreateConsumer(cg, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
     if (c1) {
-        s->tracked_struct_bytes += sizeof(streamConsumer);
+        s->tracked_overhead += sizeof(streamConsumer);
         s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
-        raxSetExternalLogicalSize(c1->pel, &s->tracked_rax_overhead);
+        raxSetExternalLogicalSize(c1->pel, &s->tracked_overhead);
     }
     streamConsumer *c2 = streamCreateConsumer(cg, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
     if (c2) {
-        s->tracked_struct_bytes += sizeof(streamConsumer);
+        s->tracked_overhead += sizeof(streamConsumer);
         s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
-        raxSetExternalLogicalSize(c2->pel, &s->tracked_rax_overhead);
+        raxSetExternalLogicalSize(c2->pel, &s->tracked_overhead);
     }
     ASSERT_STREAM_TRACKING(s);
 
@@ -297,7 +303,7 @@ int test_stream_tracking_full_lifecycle(int argc, char **argv, int flags) {
         streamEncodeID(buf, &ids[i]);
         raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
         raxInsert(c1->pel, buf, sizeof(buf), nack, NULL);
-        s->tracked_struct_bytes += sizeof(streamNACK);
+        s->tracked_overhead += sizeof(streamNACK);
     }
     ASSERT_STREAM_TRACKING(s);
 
@@ -310,12 +316,12 @@ int test_stream_tracking_full_lifecycle(int argc, char **argv, int flags) {
         raxRemove(cg->pel, buf, sizeof(buf), NULL);
         raxRemove(c1->pel, buf, sizeof(buf), NULL);
         streamFreeNACK((streamNACK *)result);
-        s->tracked_struct_bytes -= sizeof(streamNACK);
+        s->tracked_overhead -= sizeof(streamNACK);
     }
     ASSERT_STREAM_TRACKING(s);
 
     /* Delete consumer c2 (0 NACKs) — mirrors DELCONSUMER. */
-    s->tracked_struct_bytes -= sizeof(streamConsumer);
+    s->tracked_overhead -= sizeof(streamConsumer);
     s->tracked_data_bytes -= sdsReqSize(sdslen(c2->name), sdsType(c2->name));
     streamDelConsumer(cg, c2);
     ASSERT_STREAM_TRACKING(s);
@@ -345,13 +351,13 @@ int test_stream_tracking_destroy_cg(int argc, char **argv, int flags) {
     sds name1 = sdsnew("worker_alpha");
     sds name2 = sdsnew("worker_beta_longer");
     streamConsumer *c1 = streamCreateConsumer(cg2, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
-    s->tracked_struct_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += sizeof(streamConsumer);
     s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
-    raxSetExternalLogicalSize(c1->pel, &s->tracked_rax_overhead);
+    raxSetExternalLogicalSize(c1->pel, &s->tracked_overhead);
     streamConsumer *c2 = streamCreateConsumer(cg2, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
-    s->tracked_struct_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += sizeof(streamConsumer);
     s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
-    raxSetExternalLogicalSize(c2->pel, &s->tracked_rax_overhead);
+    raxSetExternalLogicalSize(c2->pel, &s->tracked_overhead);
 
     streamID ids[10];
     for (int i = 0; i < 10; i++) {
@@ -368,20 +374,20 @@ int test_stream_tracking_destroy_cg(int argc, char **argv, int flags) {
         streamConsumer *target = (i < 4 ? c1 : c2);
         raxInsert(cg2->pel, buf, sizeof(buf), nack, NULL);
         raxInsert(target->pel, buf, sizeof(buf), nack, NULL);
-        s->tracked_struct_bytes += sizeof(streamNACK);
+        s->tracked_overhead += sizeof(streamNACK);
     }
     ASSERT_STREAM_TRACKING(s);
 
     /* Destroy cg2 — mirrors xgroupCommand DESTROY. */
     raxRemove(s->cgroups, (unsigned char *)"grp2", 4, NULL);
-    s->tracked_struct_bytes -= sizeof(streamCG);
+    s->tracked_overhead -= sizeof(streamCG);
     raxFreeWithCallbackAndContext(cg2->pel, streamFreeNACKWithTracking, s);
     raxFreeWithCallbackAndContext(cg2->consumers, streamFreeConsumerWithTracking, s);
     zfree(cg2);
     ASSERT_STREAM_TRACKING(s);
 
     /* grp1 still exists */
-    TEST_ASSERT(s->tracked_struct_bytes > 0);
+    TEST_ASSERT(s->tracked_overhead > 0);
 
     sdsfree(name1);
     sdsfree(name2);
@@ -402,9 +408,9 @@ int test_stream_tracking_del_consumer(int argc, char **argv, int flags) {
     robj *key = createStringObject("mystream", 8);
     sds name = sdsnew("busy_consumer");
     streamConsumer *consumer = streamCreateConsumer(cg, name, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
-    s->tracked_struct_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += sizeof(streamConsumer);
     s->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
-    raxSetExternalLogicalSize(consumer->pel, &s->tracked_rax_overhead);
+    raxSetExternalLogicalSize(consumer->pel, &s->tracked_overhead);
 
     /* Deliver 8 NACKs — mirrors streamReplyWithRange. */
     streamID ids[8];
@@ -419,13 +425,13 @@ int test_stream_tracking_del_consumer(int argc, char **argv, int flags) {
         streamEncodeID(buf, &ids[i]);
         raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
         raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
-        s->tracked_struct_bytes += sizeof(streamNACK);
+        s->tracked_overhead += sizeof(streamNACK);
     }
     ASSERT_STREAM_TRACKING(s);
 
     /* Delete consumer — mirrors xgroupCommand DELCONSUMER. */
     long long pending = raxSize(consumer->pel);
-    s->tracked_struct_bytes -= sizeof(streamConsumer) + pending * sizeof(streamNACK);
+    s->tracked_overhead -= sizeof(streamConsumer) + pending * sizeof(streamNACK);
     s->tracked_data_bytes -= sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
     streamDelConsumer(cg, consumer);
     ASSERT_STREAM_TRACKING(s);
@@ -454,9 +460,9 @@ int test_stream_tracking_dup(int argc, char **argv, int flags) {
     robj *key = createStringObject("mystream", 8);
     sds name = sdsnew("consumer_one");
     streamConsumer *consumer = streamCreateConsumer(cg, name, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
-    s->tracked_struct_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += sizeof(streamConsumer);
     s->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
-    raxSetExternalLogicalSize(consumer->pel, &s->tracked_rax_overhead);
+    raxSetExternalLogicalSize(consumer->pel, &s->tracked_overhead);
 
     /* Deliver NACKs — mirrors streamReplyWithRange. */
     streamID ids[5];
@@ -471,7 +477,7 @@ int test_stream_tracking_dup(int argc, char **argv, int flags) {
         streamEncodeID(buf, &ids[i]);
         raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
         raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
-        s->tracked_struct_bytes += sizeof(streamNACK);
+        s->tracked_overhead += sizeof(streamNACK);
     }
     ASSERT_STREAM_TRACKING(s);
 
@@ -485,7 +491,7 @@ int test_stream_tracking_dup(int argc, char **argv, int flags) {
 
     ASSERT_STREAM_TRACKING(new_s);
     TEST_ASSERT(s->tracked_data_bytes == new_s->tracked_data_bytes);
-    TEST_ASSERT(s->tracked_struct_bytes == new_s->tracked_struct_bytes);
+    TEST_ASSERT(s->tracked_overhead == new_s->tracked_overhead);
 
     objectSetVal(orig, NULL); /* prevent double-free of s */
     decrRefCount(orig);
@@ -548,9 +554,9 @@ int test_stream_tracking_fuzzer(int argc, char **argv, int flags) {
             streamConsumer *c = streamCreateConsumer(cgs[cg_idx], sname, key, 0,
                                                      SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
             if (c) {
-                s->tracked_struct_bytes += sizeof(streamConsumer);
+                s->tracked_overhead += sizeof(streamConsumer);
                 s->tracked_data_bytes += sdsReqSize(sdslen(c->name), sdsType(c->name));
-                raxSetExternalLogicalSize(c->pel, &s->tracked_rax_overhead);
+                raxSetExternalLogicalSize(c->pel, &s->tracked_overhead);
             }
             sdsfree(sname);
         } else if (action < 85 && id_count > 0) {
@@ -570,7 +576,7 @@ int test_stream_tracking_fuzzer(int argc, char **argv, int flags) {
                 streamNACK *nack = streamCreateNACK(c);
                 if (raxTryInsert(cgs[cg_idx]->pel, buf, sizeof(buf), nack, NULL)) {
                     raxInsert(c->pel, buf, sizeof(buf), nack, NULL);
-                    s->tracked_struct_bytes += sizeof(streamNACK);
+                    s->tracked_overhead += sizeof(streamNACK);
                     if (pending_count < 4096) {
                         pending[pending_count].cg_idx = cg_idx;
                         pending[pending_count].id = ids[idx];
@@ -593,7 +599,7 @@ int test_stream_tracking_fuzzer(int argc, char **argv, int flags) {
                 raxRemove(cgs[cg_idx]->pel, buf, sizeof(buf), NULL);
                 raxRemove(nack_consumer->pel, buf, sizeof(buf), NULL);
                 streamFreeNACK(nack);
-                s->tracked_struct_bytes -= sizeof(streamNACK);
+                s->tracked_overhead -= sizeof(streamNACK);
             }
             pending[idx] = pending[--pending_count];
         }
