@@ -210,6 +210,7 @@ int raxEOF(raxIterator *it);
 void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 size_t raxAllocSize(rax *rax);
+size_t raxComputeLogicalSize(rax *rax);
 void raxSetExternalLogicalSize(rax *rax, size_t *ptr);
 void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx);
 unsigned long raxTouch(raxNode *n);
