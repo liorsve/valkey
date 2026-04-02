@@ -21,11 +21,9 @@ typedef struct stream {
     streamID first_id;             /* The first non-tombstone entry, zero if empty. */
     streamID max_deleted_entry_id; /* The maximal ID that was deleted. */
     uint64_t entries_added;        /* All time count of elements added. */
-    size_t tracked_data_bytes;     /* Variable-size data: listpack bytes (lpBytes)
-                                    * + consumer name SDS bytes (sdsReqSize). */
-    size_t tracked_metadata_bytes; /* Fixed-size structs aggregated across all CGs:
-                                    * sizeof(streamCG) + sizeof(streamNACK) +
-                                    * sizeof(streamConsumer) per instance. */
+    size_t tracked_data_bytes;     /* Listpack bytes + consumer name SDS bytes +
+                                    * sizeof(streamCG/NACK/Consumer) for all structs. */
+    size_t tracked_overhead;       /* Rax node overhead only (raxLogicalSize deltas). */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without
