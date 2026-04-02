@@ -82,7 +82,8 @@ stream *streamNew(void) {
     s->max_deleted_entry_id.ms = 0;
     s->entries_added = 0;
     s->tracked_data_bytes = 0;
-    s->tracked_metadata_bytes = raxLogicalSize(s->rax);
+
+    s->tracked_overhead = raxLogicalSize(s->rax);
     s->cgroups = NULL; /* Created on demand to save memory when not used. */
     return s;
 }
@@ -97,14 +98,15 @@ void streamFreeLPWithTracking(void *data, void *ctx) {
 
 void streamFreeNACKWithTracking(void *data, void *ctx) {
     stream *s = ctx;
-    s->tracked_metadata_bytes -= sizeof(streamNACK);
+    s->tracked_data_bytes -= sizeof(streamNACK);
     zfree(data);
 }
 
 void streamFreeConsumerWithTracking(void *data, void *ctx) {
     stream *s = ctx;
     streamConsumer *sc = data;
-    s->tracked_metadata_bytes -= sizeof(streamConsumer) + raxLogicalSize(sc->pel);
+    s->tracked_data_bytes -= sizeof(streamConsumer);
+    s->tracked_overhead -= raxLogicalSize(sc->pel);
     s->tracked_data_bytes -= sdsReqSize(sdslen(sc->name), sdsType(sc->name));
     raxFree(sc->pel);
     sdsfree(sc->name);
@@ -114,7 +116,8 @@ void streamFreeConsumerWithTracking(void *data, void *ctx) {
 void streamFreeCGWithTracking(void *data, void *ctx) {
     stream *s = ctx;
     streamCG *cg = data;
-    s->tracked_metadata_bytes -= sizeof(streamCG) + raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers);
+    s->tracked_data_bytes -= sizeof(streamCG);
+    s->tracked_overhead -= raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers);
     raxFreeWithCallbackAndContext(cg->pel, streamFreeNACKWithTracking, s);
     raxFreeWithCallbackAndContext(cg->consumers, streamFreeConsumerWithTracking, s);
     zfree(cg);
@@ -122,25 +125,25 @@ void streamFreeCGWithTracking(void *data, void *ctx) {
 
 /* Free a stream, including the listpacks stored inside the radix tree. */
 void freeStream(stream *s) {
-    s->tracked_metadata_bytes -= raxLogicalSize(s->rax);
+    s->tracked_overhead -= raxLogicalSize(s->rax);
     raxFreeWithCallbackAndContext(s->rax, streamFreeLPWithTracking, s);
     if (s->cgroups) {
-        s->tracked_metadata_bytes -= raxLogicalSize(s->cgroups);
+        s->tracked_overhead -= raxLogicalSize(s->cgroups);
         raxFreeWithCallbackAndContext(s->cgroups, streamFreeCGWithTracking, s);
     }
     zfree(s);
 }
 
-/* Test helper: verify that tracked_data_bytes and tracked_metadata_bytes
+/* Test helper: verify that tracked_data_bytes and tracked_overhead
  * match a full O(n) walk of the stream hierarchy. Used by DEBUG
  * STREAM-VERIFY-TRACKING to validate tracking correctness in integration
  * tests. Returns 1 if correct, 0 on mismatch with a description written
  * to errmsg. */
 int streamVerifyTracking(stream *s, char *errmsg, size_t errlen) {
-    size_t walk_data = 0, walk_meta = 0;
+    size_t walk_data = 0, walk_overhead = 0;
 
     /* Rax overhead for the main listpack rax */
-    walk_meta += raxLogicalSize(s->rax);
+    walk_overhead += raxLogicalSize(s->rax);
 
     /* Listpacks */
     raxIterator ri;
@@ -151,23 +154,23 @@ int streamVerifyTracking(stream *s, char *errmsg, size_t errlen) {
 
     /* CGs */
     if (s->cgroups) {
-        walk_meta += raxLogicalSize(s->cgroups);
+        walk_overhead += raxLogicalSize(s->cgroups);
         raxStart(&ri, s->cgroups);
         raxSeek(&ri, "^", NULL, 0);
         while (raxNext(&ri)) {
             streamCG *cg = ri.data;
-            walk_meta += sizeof(streamCG);
-            walk_meta += raxLogicalSize(cg->pel);
-            walk_meta += raxSize(cg->pel) * sizeof(streamNACK);
-            walk_meta += raxLogicalSize(cg->consumers);
+            walk_data += sizeof(streamCG);
+            walk_overhead += raxLogicalSize(cg->pel);
+            walk_data += raxSize(cg->pel) * sizeof(streamNACK);
+            walk_overhead += raxLogicalSize(cg->consumers);
 
             raxIterator ci;
             raxStart(&ci, cg->consumers);
             raxSeek(&ci, "^", NULL, 0);
             while (raxNext(&ci)) {
                 streamConsumer *sc = ci.data;
-                walk_meta += sizeof(streamConsumer);
-                walk_meta += raxLogicalSize(sc->pel);
+                walk_data += sizeof(streamConsumer);
+                walk_overhead += raxLogicalSize(sc->pel);
                 walk_data += sdsReqSize(sdslen(sc->name), sdsType(sc->name));
             }
             raxStop(&ci);
@@ -181,10 +184,10 @@ int streamVerifyTracking(stream *s, char *errmsg, size_t errlen) {
                  s->tracked_data_bytes, walk_data);
         return 0;
     }
-    if (s->tracked_metadata_bytes != walk_meta) {
+    if (s->tracked_overhead != walk_overhead) {
         snprintf(errmsg, errlen,
-                 "tracked_metadata_bytes mismatch: tracked=%zu walked=%zu",
-                 s->tracked_metadata_bytes, walk_meta);
+                 "tracked_overhead mismatch: tracked=%zu walked=%zu",
+                 s->tracked_overhead, walk_overhead);
         return 0;
     }
     return 1;
@@ -288,7 +291,7 @@ robj *streamDup(robj *o) {
         raxInsert(new_s->rax, (unsigned char *)&rax_key, sizeof(rax_key), new_lp, NULL);
         new_s->tracked_data_bytes += lp_bytes;
     }
-    new_s->tracked_metadata_bytes += raxLogicalSize(new_s->rax) - rax_before;
+    new_s->tracked_overhead += raxLogicalSize(new_s->rax) - rax_before;
     new_s->length = s->length;
     new_s->first_id = s->first_id;
     new_s->last_id = s->last_id;
@@ -320,10 +323,10 @@ robj *streamDup(robj *o) {
             new_nack->delivery_time = nack->delivery_time;
             new_nack->delivery_count = nack->delivery_count;
             raxInsert(new_cg->pel, ri_cg_pel.key, sizeof(streamID), new_nack, NULL);
-            new_s->tracked_metadata_bytes += sizeof(streamNACK);
+            new_s->tracked_data_bytes += sizeof(streamNACK);
         }
         raxStop(&ri_cg_pel);
-        new_s->tracked_metadata_bytes += raxLogicalSize(new_cg->pel) - pel_before;
+        new_s->tracked_overhead += raxLogicalSize(new_cg->pel) - pel_before;
 
         /* Consumers */
         raxIterator ri_consumers;
@@ -338,7 +341,8 @@ robj *streamDup(robj *o) {
             new_consumer->pel = raxNew();
             raxInsert(new_cg->consumers, (unsigned char *)new_consumer->name, sdslen(new_consumer->name), new_consumer,
                       NULL);
-            new_s->tracked_metadata_bytes += sizeof(streamConsumer) + raxLogicalSize(new_consumer->pel);
+            new_s->tracked_data_bytes += sizeof(streamConsumer);
+            new_s->tracked_overhead += raxLogicalSize(new_consumer->pel);
             new_s->tracked_data_bytes += sdsReqSize(sdslen(new_consumer->name), sdsType(new_consumer->name));
             new_consumer->seen_time = consumer->seen_time;
             new_consumer->active_time = consumer->active_time;
@@ -359,10 +363,10 @@ robj *streamDup(robj *o) {
                 raxInsert(new_consumer->pel, ri_cpel.key, sizeof(streamID), new_nack, NULL);
             }
             raxStop(&ri_cpel);
-            new_s->tracked_metadata_bytes += raxLogicalSize(new_consumer->pel) - cpel_before;
+            new_s->tracked_overhead += raxLogicalSize(new_consumer->pel) - cpel_before;
         }
         raxStop(&ri_consumers);
-        new_s->tracked_metadata_bytes += raxLogicalSize(new_cg->consumers) - cons_before;
+        new_s->tracked_overhead += raxLogicalSize(new_cg->consumers) - cons_before;
     }
     raxStop(&ri_cgroups);
     return sobj;
@@ -685,7 +689,7 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         lp = lpAppendInteger(lp, 0); /* primary entry zero terminator. */
         size_t srax_before = raxLogicalSize(s->rax);
         raxInsert(s->rax, (unsigned char *)&rax_key, sizeof(rax_key), lp, NULL);
-        s->tracked_metadata_bytes += raxLogicalSize(s->rax) - srax_before;
+        s->tracked_overhead += raxLogicalSize(s->rax) - srax_before;
         /* The first entry we insert, has obviously the same fields of the
          * primary entry. */
         flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
@@ -869,7 +873,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
             lpFree(lp);
             size_t srax_before = raxLogicalSize(s->rax);
             raxRemove(s->rax, ri.key, ri.key_len, NULL);
-            s->tracked_metadata_bytes -= srax_before - raxLogicalSize(s->rax);
+            s->tracked_overhead -= srax_before - raxLogicalSize(s->rax);
             raxSeek(&ri, ">=", ri.key, ri.key_len);
             s->length -= entries;
             deleted += entries;
@@ -1399,7 +1403,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
         lpFree(lp);
         size_t srax_before = raxLogicalSize(si->stream->rax);
         raxRemove(si->stream->rax, si->ri.key, si->ri.key_len, NULL);
-        si->stream->tracked_metadata_bytes -= srax_before - raxLogicalSize(si->stream->rax);
+        si->stream->tracked_overhead -= srax_before - raxLogicalSize(si->stream->rax);
     } else {
         /* In the base case we alter the counters of valid/deleted entries. */
         lp = lpReplaceInteger(lp, &p, aux - 1);
@@ -1892,7 +1896,7 @@ size_t streamReplyWithRange(client *c,
                 nack = result;
                 size_t old_cpel_before = raxLogicalSize(nack->consumer->pel);
                 raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
-                s->tracked_metadata_bytes -= old_cpel_before - raxLogicalSize(nack->consumer->pel);
+                s->tracked_overhead -= old_cpel_before - raxLogicalSize(nack->consumer->pel);
                 /* Update the consumer and NACK metadata. */
                 nack->consumer = consumer;
                 nack->delivery_time = commandTimeSnapshot();
@@ -1900,12 +1904,13 @@ size_t streamReplyWithRange(client *c,
                 /* Add the entry in the new consumer local PEL. */
                 size_t new_cpel_before = raxLogicalSize(consumer->pel);
                 raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
-                s->tracked_metadata_bytes += raxLogicalSize(consumer->pel) - new_cpel_before;
+                s->tracked_overhead += raxLogicalSize(consumer->pel) - new_cpel_before;
             } else if (group_inserted == 1 && consumer_inserted == 0) {
                 serverPanic("NACK half-created. Should not be possible.");
             }
             if (group_inserted) {
-                s->tracked_metadata_bytes += sizeof(streamNACK) + (raxLogicalSize(group->pel) - gpel_before) + (raxLogicalSize(consumer->pel) - cpel_before);
+                s->tracked_data_bytes += sizeof(streamNACK);
+                s->tracked_overhead += (raxLogicalSize(group->pel) - gpel_before) + (raxLogicalSize(consumer->pel) - cpel_before);
             }
 
             consumer->active_time = commandTimeSnapshot();
@@ -2500,7 +2505,8 @@ void xreadCommand(client *c) {
                 consumer = streamCreateConsumer(groups[i], objectGetVal(consumername), c->argv[streams_arg + i], c->db->id,
                                                 SCC_DEFAULT);
                 if (consumer) {
-                    s->tracked_metadata_bytes += sizeof(streamConsumer) + raxLogicalSize(consumer->pel) + (raxLogicalSize(groups[i]->consumers) - cons_before);
+                    s->tracked_data_bytes += sizeof(streamConsumer);
+                    s->tracked_overhead += raxLogicalSize(consumer->pel) + (raxLogicalSize(groups[i]->consumers) - cons_before);
                     s->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
                 }
                 if (noack) streamPropagateConsumerCreation(c, spi.keyname, spi.groupname, consumer->name);
@@ -2637,7 +2643,8 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     cg->last_id = *id;
     cg->entries_read = entries_read;
     raxInsert(s->cgroups, (unsigned char *)name, namelen, cg, NULL);
-    s->tracked_metadata_bytes += sizeof(streamCG) + (raxLogicalSize(s->cgroups) - rax_before) + raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers);
+    s->tracked_data_bytes += sizeof(streamCG);
+    s->tracked_overhead += (raxLogicalSize(s->cgroups) - rax_before) + raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers);
     return cg;
 }
 
@@ -2850,7 +2857,8 @@ void xgroupCommand(client *c) {
             size_t cgroups_before = raxLogicalSize(s->cgroups);
             raxRemove(s->cgroups, (unsigned char *)grpname, sdslen(grpname), NULL);
             /* Free CG with tracking — subtracts NACKs, consumers, names. */
-            s->tracked_metadata_bytes -= sizeof(streamCG) + raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers) + (cgroups_before - raxLogicalSize(s->cgroups));
+            s->tracked_data_bytes -= sizeof(streamCG);
+            s->tracked_overhead -= raxLogicalSize(cg->pel) + raxLogicalSize(cg->consumers) + (cgroups_before - raxLogicalSize(s->cgroups));
             raxFreeWithCallbackAndContext(cg->pel, streamFreeNACKWithTracking, s);
             raxFreeWithCallbackAndContext(cg->consumers, streamFreeConsumerWithTracking, s);
             zfree(cg);
@@ -2866,7 +2874,8 @@ void xgroupCommand(client *c) {
         size_t cons_before = raxLogicalSize(cg->consumers);
         streamConsumer *created = streamCreateConsumer(cg, objectGetVal(c->argv[4]), c->argv[2], c->db->id, SCC_DEFAULT);
         if (created) {
-            s->tracked_metadata_bytes += sizeof(streamConsumer) + raxLogicalSize(created->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+            s->tracked_data_bytes += sizeof(streamConsumer);
+            s->tracked_overhead += raxLogicalSize(created->pel) + (raxLogicalSize(cg->consumers) - cons_before);
             s->tracked_data_bytes += sdsReqSize(sdslen(created->name), sdsType(created->name));
         }
         addReplyLongLong(c, created ? 1 : 0);
@@ -2880,10 +2889,10 @@ void xgroupCommand(client *c) {
             size_t gpel_before = raxLogicalSize(cg->pel);
             size_t cons_before = raxLogicalSize(cg->consumers);
             size_t cpel_size = raxLogicalSize(consumer->pel);
-            s->tracked_metadata_bytes -= sizeof(streamConsumer) + pending * sizeof(streamNACK);
+            s->tracked_data_bytes -= sizeof(streamConsumer) + pending * sizeof(streamNACK);
             s->tracked_data_bytes -= sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
             streamDelConsumer(cg, consumer);
-            s->tracked_metadata_bytes -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
+            s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
             server.dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-delconsumer", c->argv[2], c->db->id);
         }
@@ -3016,7 +3025,8 @@ void xackCommand(client *c) {
             size_t cpel_before = raxLogicalSize(nack_consumer->pel);
             raxRemove(nack_consumer->pel, buf, sizeof(buf), NULL);
             streamFreeNACK(nack);
-            ((stream *)objectGetVal(o))->tracked_metadata_bytes -= sizeof(streamNACK) + (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
+            ((stream *)objectGetVal(o))->tracked_data_bytes -= sizeof(streamNACK);
+            ((stream *)objectGetVal(o))->tracked_overhead -= (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
             acknowledged++;
             server.dirty++;
         }
@@ -3377,7 +3387,8 @@ void xclaimCommand(client *c) {
         consumer = streamCreateConsumer(group, objectGetVal(c->argv[3]), c->argv[1], c->db->id, SCC_DEFAULT);
         if (consumer) {
             stream *sobj = objectGetVal(o);
-            sobj->tracked_metadata_bytes += sizeof(streamConsumer) + raxLogicalSize(consumer->pel) + (raxLogicalSize(group->consumers) - cons_before);
+            sobj->tracked_data_bytes += sizeof(streamConsumer);
+            sobj->tracked_overhead += raxLogicalSize(consumer->pel) + (raxLogicalSize(group->consumers) - cons_before);
             sobj->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
         }
     }
@@ -3410,7 +3421,8 @@ void xclaimCommand(client *c) {
                 size_t cpel_before = raxLogicalSize(nack_consumer->pel);
                 raxRemove(nack_consumer->pel, buf, sizeof(buf), NULL);
                 streamFreeNACK(nack);
-                ((stream *)objectGetVal(o))->tracked_metadata_bytes -= sizeof(streamNACK) + (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
+                ((stream *)objectGetVal(o))->tracked_data_bytes -= sizeof(streamNACK);
+                ((stream *)objectGetVal(o))->tracked_overhead -= (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
             }
             continue;
         }
@@ -3425,7 +3437,8 @@ void xclaimCommand(client *c) {
             nack = streamCreateNACK(NULL);
             size_t gpel_before = raxLogicalSize(group->pel);
             raxInsert(group->pel, buf, sizeof(buf), nack, NULL);
-            ((stream *)objectGetVal(o))->tracked_metadata_bytes += sizeof(streamNACK) + (raxLogicalSize(group->pel) - gpel_before);
+            ((stream *)objectGetVal(o))->tracked_data_bytes += sizeof(streamNACK);
+            ((stream *)objectGetVal(o))->tracked_overhead += (raxLogicalSize(group->pel) - gpel_before);
         }
 
         if (nack != NULL) {
@@ -3447,7 +3460,7 @@ void xclaimCommand(client *c) {
                 if (nack->consumer) {
                     size_t cpel_before = raxLogicalSize(nack->consumer->pel);
                     raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
-                    ((stream *)objectGetVal(o))->tracked_metadata_bytes -= cpel_before - raxLogicalSize(nack->consumer->pel);
+                    ((stream *)objectGetVal(o))->tracked_overhead -= cpel_before - raxLogicalSize(nack->consumer->pel);
                 }
             }
             nack->delivery_time = deliverytime;
@@ -3462,7 +3475,7 @@ void xclaimCommand(client *c) {
                 /* Add the entry in the new consumer local PEL. */
                 size_t cpel_before = raxLogicalSize(consumer->pel);
                 raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
-                ((stream *)objectGetVal(o))->tracked_metadata_bytes += raxLogicalSize(consumer->pel) - cpel_before;
+                ((stream *)objectGetVal(o))->tracked_overhead += raxLogicalSize(consumer->pel) - cpel_before;
                 nack->consumer = consumer;
             }
             /* Send the reply for this entry. */
@@ -3574,7 +3587,8 @@ void xautoclaimCommand(client *c) {
         consumer = streamCreateConsumer(group, objectGetVal(c->argv[3]), c->argv[1], c->db->id, SCC_DEFAULT);
         if (consumer) {
             stream *sobj = objectGetVal(o);
-            sobj->tracked_metadata_bytes += sizeof(streamConsumer) + raxLogicalSize(consumer->pel) + (raxLogicalSize(group->consumers) - cons_before);
+            sobj->tracked_data_bytes += sizeof(streamConsumer);
+            sobj->tracked_overhead += raxLogicalSize(consumer->pel) + (raxLogicalSize(group->consumers) - cons_before);
             sobj->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
         }
     }
@@ -3614,7 +3628,8 @@ void xautoclaimCommand(client *c) {
             size_t cpel_before = raxLogicalSize(nack_consumer->pel);
             raxRemove(nack_consumer->pel, ri.key, ri.key_len, NULL);
             streamFreeNACK(nack);
-            ((stream *)objectGetVal(o))->tracked_metadata_bytes -= sizeof(streamNACK) + (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
+            ((stream *)objectGetVal(o))->tracked_data_bytes -= sizeof(streamNACK);
+            ((stream *)objectGetVal(o))->tracked_overhead -= (gpel_before - raxLogicalSize(group->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
             /* Remember the ID for later */
             deleted_ids[deleted_id_num++] = id;
             raxSeek(&ri, ">=", ri.key, ri.key_len);
@@ -3634,7 +3649,7 @@ void xautoclaimCommand(client *c) {
             if (nack->consumer) {
                 size_t cpel_before = raxLogicalSize(nack->consumer->pel);
                 raxRemove(nack->consumer->pel, ri.key, ri.key_len, NULL);
-                ((stream *)objectGetVal(o))->tracked_metadata_bytes -= cpel_before - raxLogicalSize(nack->consumer->pel);
+                ((stream *)objectGetVal(o))->tracked_overhead -= cpel_before - raxLogicalSize(nack->consumer->pel);
             }
         }
 
@@ -3647,7 +3662,7 @@ void xautoclaimCommand(client *c) {
             /* Add the entry in the new consumer local PEL. */
             size_t cpel_before = raxLogicalSize(consumer->pel);
             raxInsert(consumer->pel, ri.key, ri.key_len, nack, NULL);
-            ((stream *)objectGetVal(o))->tracked_metadata_bytes += raxLogicalSize(consumer->pel) - cpel_before;
+            ((stream *)objectGetVal(o))->tracked_overhead += raxLogicalSize(consumer->pel) - cpel_before;
             nack->consumer = consumer;
         }
 
