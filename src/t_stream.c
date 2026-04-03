@@ -486,7 +486,6 @@ void streamDecodeID(void *buf, streamID *id) {
     id->seq = ntohu64(e[1]);
 }
 
-
 /* Compare two stream IDs. Return -1 if a < b, 0 if a == b, 1 if a > b. */
 int streamCompareID(streamID *a, streamID *b) {
     if (a->ms > b->ms)
@@ -770,8 +769,8 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     lp = lpAppendInteger(lp, lp_count);
 
     /* Insert back into the tree in order to update the listpack pointer. */
-    s->tracked_data_bytes += (int64_t)lpBytes(lp) - (int64_t)lp_old_bytes;
     if (ri.data != lp) raxInsert(s->rax, (unsigned char *)&rax_key, sizeof(rax_key), lp, NULL);
+    s->tracked_data_bytes += (int64_t)lpBytes(lp) - (int64_t)lp_old_bytes;
     s->length++;
     s->entries_added++;
     s->last_id = id;
