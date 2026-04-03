@@ -131,22 +131,20 @@ typedef struct raxNode {
 } raxNode;
 
 typedef struct rax {
-    raxNode *head;     /* Pointer to root node of tree */
-    uint64_t numele;   /* Number of keys in the tree */
-    uint64_t numnodes; /* Number of rax nodes in the tree */
-    size_t alloc_size; /* Total allocation size of the tree in bytes */
-    size_t *external_logical_size; /* If non-NULL, logical size deltas
-                                    * (using raxNodeCurrentLength) are
-                                    * propagated here on every mutation.
-                                    * Allows multiple rax trees to aggregate
-                                    * their overhead into one counter. */
+    raxNode *head;                     /* Pointer to root node of tree */
+    uint64_t numele;                   /* Number of keys in the tree */
+    uint64_t numnodes;                 /* Number of rax nodes in the tree */
+    size_t alloc_size;                 /* Total allocation size of the tree in bytes */
+    size_t *external_logical_size;     /* If non-NULL, logical size deltas
+                                        * (using raxNodeCurrentLength) are
+                                        * propagated here on every mutation.
+                                        * Allows multiple rax trees to aggregate
+                                        * their overhead into one counter. */
     size_t (*dataGetSize)(void *data); /* If non-NULL, called on new key insert,
                                         * remove, and recursive free to compute
                                         * data payload size. NOT called on
                                         * overwrite (stale pointer risk). */
-    size_t *external_tracked_data;     /* Destination for dataGetSize deltas and
-                                        * manual adjustments via
-                                        * raxAdjustTrackedDataBytes. */
+    size_t *external_tracked_data;     /* Destination for dataGetSize deltas. */
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -220,7 +218,6 @@ size_t raxAllocSize(rax *rax);
 size_t raxComputeLogicalSize(rax *rax);
 void raxSetExternalLogicalSize(rax *rax, size_t *ptr);
 void raxSetDataTracking(rax *rax, size_t (*dataGetSize)(void *data), size_t *ext_ptr);
-void raxAdjustTrackedDataBytes(rax *rax, int64_t delta);
 void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
