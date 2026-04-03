@@ -482,11 +482,11 @@ TEST_F(VsetTest, TestVsetFuzzer) {
 
 /* ── Tracking tests ─────────────────────────────────────────────────── */
 
-#define ASSERT_VSET_TRACKING(set)                                          \
-    do {                                                                   \
-        char errmsg[256];                                                  \
-        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg)))       \
-            << errmsg;                                                     \
+#define ASSERT_VSET_TRACKING(set)                                    \
+    do {                                                             \
+        char errmsg[256];                                            \
+        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg))) \
+            << errmsg;                                               \
     } while (0)
 
 /* Force promotion to RAX by inserting enough entries with spread expiries */
@@ -538,7 +538,7 @@ TEST_F(VsetTest, TrackingExpireFromRax) {
         ASSERT_VSET_TRACKING(&set);
     }
 
-    expire_mock_entries(&set, LONG_LONG_MAX);
+    expire_mock_entries(&set, LLONG_MAX);
     vsetRelease(&set);
 }
 
@@ -661,6 +661,6 @@ TEST_F(VsetTest, TrackingFuzzer) {
     }
     ASSERT_VSET_TRACKING(&set);
 
-    expire_mock_entries(&set, LONG_LONG_MAX);
+    expire_mock_entries(&set, LLONG_MAX);
     vsetRelease(&set);
 }

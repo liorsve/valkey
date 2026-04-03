@@ -2659,13 +2659,12 @@ streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid
     int notify = !(flags & SCC_NO_NOTIFY);
     int dirty = !(flags & SCC_NO_DIRTIFY);
     streamConsumer *consumer = zmalloc(sizeof(*consumer));
-    consumer->name = sdsdup(name);
     int success = raxTryInsert(cg->consumers, (unsigned char *)name, sdslen(name), consumer, NULL);
     if (!success) {
-        sdsfree(consumer->name);
         zfree(consumer);
         return NULL;
     }
+    consumer->name = sdsdup(name);
     consumer->pel = raxNew();
     consumer->active_time = -1;
     consumer->seen_time = commandTimeSnapshot();

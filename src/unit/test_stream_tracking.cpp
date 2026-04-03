@@ -11,8 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 extern "C" {
 #include "listpack.h"
@@ -98,12 +98,12 @@ static size_t computeOverheadWalk(stream *s) {
     return total;
 }
 
-#define ASSERT_STREAM_TRACKING(s)                                           \
-    do {                                                                    \
-        ASSERT_EQ((s)->tracked_data_bytes, computeDataBytesWalk(s))         \
-            << "tracked_data_bytes mismatch";                               \
-        ASSERT_EQ((s)->tracked_overhead, computeOverheadWalk(s))            \
-            << "tracked_overhead mismatch";                                 \
+#define ASSERT_STREAM_TRACKING(s)                                   \
+    do {                                                            \
+        ASSERT_EQ((s)->tracked_data_bytes, computeDataBytesWalk(s)) \
+            << "tracked_data_bytes mismatch";                       \
+        ASSERT_EQ((s)->tracked_overhead, computeOverheadWalk(s))    \
+            << "tracked_overhead mismatch";                         \
     } while (0)
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
@@ -508,6 +508,47 @@ TEST_F(StreamTrackingTest, Fuzzer) {
         if (op % 50 == 0) ASSERT_STREAM_TRACKING(s);
     }
     ASSERT_STREAM_TRACKING(s);
+    decrRefCount(key);
+    freeStream(s);
+}
+
+TEST_F(StreamTrackingTest, SharedPrefixConsumerRemoval) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"grp", 3, &zero, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    robj *key = createStringObject("mystream", 8);
+    sds name1 = sdsnew("worker");
+    sds name2 = sdsnew("worker_alpha");
+    streamConsumer *c1 = streamCreateConsumer(cg, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    if (c1) {
+        s->tracked_data_bytes += sizeof(streamConsumer);
+        s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+        raxSetExternalLogicalSize(c1->pel, &s->tracked_overhead);
+    }
+    streamConsumer *c2 = streamCreateConsumer(cg, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    if (c2) {
+        s->tracked_data_bytes += sizeof(streamConsumer);
+        s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+        raxSetExternalLogicalSize(c2->pel, &s->tracked_overhead);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    s->tracked_data_bytes -= sizeof(streamConsumer);
+    s->tracked_data_bytes -= sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+    streamDelConsumer(cg, c1);
+    ASSERT_STREAM_TRACKING(s);
+
+    s->tracked_data_bytes -= sizeof(streamConsumer);
+    s->tracked_data_bytes -= sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+    streamDelConsumer(cg, c2);
+    ASSERT_STREAM_TRACKING(s);
+
+    sdsfree(name1);
+    sdsfree(name2);
     decrRefCount(key);
     freeStream(s);
 }

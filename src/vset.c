@@ -803,9 +803,18 @@ static inline hashtable *vsetBucketHashtable(vsetBucket *b) {
 }
 
 
+/* Wrapper around rax for RAX-encoded vset buckets. Holds tracking
+ * counters so vsetMemUsage can be O(1) instead of iterating all inner
+ * buckets. The tagged VSET_BUCKET_RAX pointer points to this struct.
+ *
+ * tracked_data_bytes covers only the vset container overhead (pVector
+ * headers + pointer arrays, hashtable bucket arrays). The actual entry
+ * data is owned and counted by the hash's hashtable tracking, not here. */
 typedef struct vsetRaxState {
     rax *r;
-    size_t tracked_data_bytes;   /* Sum of inner bucket data sizes */
+    size_t tracked_data_bytes;   /* Sum of inner bucket logical sizes
+                                  * (sizeof(pVector) + len*sizeof(void*) for VECTOR,
+                                  * hashtableMemUsage for HT). */
     size_t tracked_rax_overhead; /* Auto via external_logical_size */
 } vsetRaxState;
 
@@ -1719,8 +1728,31 @@ static inline size_t vsetBucketMemUsage_HASHTABLE(vsetBucket *bucket) {
 }
 
 static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
-    vsetRaxState *state = vsetBucketRaxState(bucket);
-    return sizeof(vsetRaxState) + state->tracked_rax_overhead + state->tracked_data_bytes;
+    rax *r = vsetBucketRax(bucket);
+    size_t total_mem = raxAllocSize(r);
+    raxIterator it;
+    raxStart(&it, r);
+    assert(raxSeek(&it, "^", NULL, 0));
+    while (raxNext(&it)) {
+        switch (vsetBucketType(it.data)) {
+        case VSET_BUCKET_NONE:
+            total_mem += vsetBucketMemUsage_NONE(it.data);
+            break;
+        case VSET_BUCKET_SINGLE:
+            total_mem += vsetBucketMemUsage_SINGLE(it.data);
+            break;
+        case VSET_BUCKET_VECTOR:
+            total_mem += vsetBucketMemUsage_VECTOR(it.data);
+            break;
+        case VSET_BUCKET_HT:
+            total_mem += vsetBucketMemUsage_HASHTABLE(it.data);
+            break;
+        default:
+            panic("Unknown bucket type encountered in vsetBucketMemUsage_RAX");
+        }
+    }
+    raxStop(&it);
+    return total_mem;
 }
 
 /* Adds an entry to a volatile set (vset) based on its expiration time.
