@@ -804,11 +804,16 @@ static inline hashtable *vsetBucketHashtable(vsetBucket *b) {
 
 /* Wrapper around rax for RAX-encoded vset buckets. Holds a tracking
  * counter so vsetMemUsage can be O(1) instead of iterating all inner
- * buckets. The tagged VSET_BUCKET_RAX pointer points to this struct. */
+ * buckets. The tagged VSET_BUCKET_RAX pointer points to this struct.
+ *
+ * tracked_data_bytes covers only the vset container overhead (pVector
+ * headers + pointer arrays, hashtable bucket arrays). The actual entry
+ * data is owned and counted by the hash's hashtable tracking, not here. */
 typedef struct vsetRaxState {
     rax *r;
-    size_t tracked_data_bytes; /* Sum of inner bucket data sizes
-                                * (pv->alloc for VECTOR, hashtableMemUsage for HT). */
+    size_t tracked_data_bytes; /* Sum of inner bucket logical sizes
+                                * (sizeof(pVector) + len*sizeof(void*) for VECTOR,
+                                * hashtableMemUsage for HT). */
 } vsetRaxState;
 
 static inline vsetRaxState *vsetBucketRaxState(vsetBucket *b) {
@@ -1617,7 +1622,6 @@ static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExp
     }
     /* if all buckets are removed, */
     if (raxSize(buckets) == 0) {
-        vsetRaxState *state = vsetBucketRaxState(*bucket);
         raxFree(buckets);
         zfree(state);
         *bucket = vsetBucketFromNone();
@@ -1722,6 +1726,35 @@ static inline size_t vsetBucketMemUsage_HASHTABLE(vsetBucket *bucket) {
 }
 
 static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
+    rax *r = vsetBucketRax(bucket);
+    size_t total_mem = raxAllocSize(r);
+    raxIterator it;
+    raxStart(&it, r);
+    assert(raxSeek(&it, "^", NULL, 0));
+    while (raxNext(&it)) {
+        switch (vsetBucketType(it.data)) {
+        case VSET_BUCKET_NONE:
+            total_mem += vsetBucketMemUsage_NONE(it.data);
+            break;
+        case VSET_BUCKET_SINGLE:
+            total_mem += vsetBucketMemUsage_SINGLE(it.data);
+            break;
+        case VSET_BUCKET_VECTOR:
+            total_mem += vsetBucketMemUsage_VECTOR(it.data);
+            break;
+        case VSET_BUCKET_HT:
+            total_mem += vsetBucketMemUsage_HASHTABLE(it.data);
+            break;
+        default:
+            panic("Unknown bucket type encountered in vsetBucketMemUsage_RAX");
+        }
+    }
+    raxStop(&it);
+    return total_mem;
+}
+
+/* O(1) logical size — uses tracked counters instead of walking. */
+static inline size_t vsetBucketLogicalSize_RAX(vsetBucket *bucket) {
     vsetRaxState *state = vsetBucketRaxState(bucket);
     return sizeof(vsetRaxState) + raxLogicalSize(state->r) + state->tracked_data_bytes;
 }
