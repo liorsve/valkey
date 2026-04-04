@@ -209,6 +209,7 @@ void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 size_t raxAllocSize(rax *rax);
 size_t raxLogicalSize(rax *rax);
+size_t raxComputeLogicalSize(rax *rax);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
 

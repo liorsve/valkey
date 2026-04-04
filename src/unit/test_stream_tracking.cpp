@@ -32,6 +32,7 @@ int64_t streamTrimByID(stream *s, streamID minid, int approx);
 void streamEncodeID(void *buf, streamID *id);
 robj *streamDup(robj *o);
 void streamFreeCG(streamCG *cg);
+size_t raxComputeLogicalSize(rax *rax);
 }
 
 class StreamTrackingTest : public ::testing::Test {};
@@ -69,24 +70,27 @@ static size_t computeDataBytesWalk(stream *s) {
     return total;
 }
 
+/* Use raxComputeLogicalSize (O(n) walk) instead of raxLogicalSize (field read)
+ * so the ground truth is independent of the logical_size field. This catches
+ * drift bugs like the iskey sizeof(void*) fix. */
 static size_t computeOverheadWalk(stream *s) {
     size_t total = 0;
-    total += raxLogicalSize(s->rax);
+    total += raxComputeLogicalSize(s->rax);
     if (s->cgroups) {
-        total += raxLogicalSize(s->cgroups);
+        total += raxComputeLogicalSize(s->cgroups);
         raxIterator ri;
         raxStart(&ri, s->cgroups);
         raxSeek(&ri, "^", NULL, 0);
         while (raxNext(&ri)) {
             streamCG *cg = (streamCG *)ri.data;
-            total += raxLogicalSize(cg->pel);
-            total += raxLogicalSize(cg->consumers);
+            total += raxComputeLogicalSize(cg->pel);
+            total += raxComputeLogicalSize(cg->consumers);
             raxIterator ci;
             raxStart(&ci, cg->consumers);
             raxSeek(&ci, "^", NULL, 0);
             while (raxNext(&ci)) {
                 streamConsumer *sc = (streamConsumer *)ci.data;
-                total += raxLogicalSize(sc->pel);
+                total += raxComputeLogicalSize(sc->pel);
             }
             raxStop(&ci);
         }
@@ -662,6 +666,68 @@ TEST_F(StreamTrackingTest, Fuzzer) {
     /* Final check */
     ASSERT_STREAM_TRACKING(s);
 
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* Test that rax logical_size correctly accounts for the sizeof(void*) data
+ * pointer slot when iskey is set/cleared. This triggers when a rax key is
+ * removed but its node has children (iskey cleared, node not freed).
+ * Consumer names that share prefixes create this scenario. */
+TEST_F(StreamTrackingTest, SharedPrefixConsumerRemoval) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"grp", 3, &zero, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Create consumers with shared prefix — "worker" is a prefix of
+     * "worker_alpha". The rax node for "worker" will have iskey=1 AND
+     * children leading to "_alpha". */
+    robj *key = createStringObject("mystream", 8);
+    sds name1 = sdsnew("worker");
+    sds name2 = sdsnew("worker_alpha");
+    size_t cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c1 = streamCreateConsumer(cg, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+    s->tracked_overhead += raxLogicalSize(c1->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c2 = streamCreateConsumer(cg, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+    s->tracked_overhead += raxLogicalSize(c2->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete "worker" — mirrors DELCONSUMER command handler. The rax node
+     * stays because "worker_alpha" still needs the "worker" prefix. iskey
+     * is cleared, shrinking the node's logical size by sizeof(void*). */
+    {
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        size_t cons_before = raxLogicalSize(cg->consumers);
+        size_t cpel_size = raxLogicalSize(c1->pel);
+        s->tracked_data_bytes -= sizeof(streamConsumer);
+        s->tracked_data_bytes -= sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+        streamDelConsumer(cg, c1);
+        s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete "worker_alpha" — now the remaining nodes can be fully freed */
+    {
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        size_t cons_before = raxLogicalSize(cg->consumers);
+        size_t cpel_size = raxLogicalSize(c2->pel);
+        s->tracked_data_bytes -= sizeof(streamConsumer);
+        s->tracked_data_bytes -= sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+        streamDelConsumer(cg, c2);
+        s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    sdsfree(name1);
+    sdsfree(name2);
     decrRefCount(key);
     freeStream(s);
 }
