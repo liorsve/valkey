@@ -535,8 +535,9 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         }
 
         /* Otherwise set the node as a key. Note that raxSetData()
-         * will set h->iskey. */
+         * will set h->iskey, adding sizeof(void*) to the node's logical length. */
         raxSetData(h, data);
+        rax->logical_size += sizeof(void *);
         rax->numele++;
         return 1; /* Element inserted. */
     }
@@ -1036,6 +1037,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
+    if (!h->isnull) rax->logical_size -= sizeof(void *);
     h->iskey = 0;
     rax->numele--;
 
@@ -1840,6 +1842,26 @@ size_t raxAllocSize(rax *rax) {
 /* Return the rax tree logical size in bytes */
 size_t raxLogicalSize(rax *rax) {
     return rax->logical_size;
+}
+
+/* Compute the total logical size of a rax tree by walking all nodes.
+ * O(n) — intended for testing/verification only. Independent of the
+ * logical_size field, so it can detect drift in that field. */
+static size_t raxRecursiveComputeLogicalSize(raxNode *n) {
+    size_t total = raxNodeCurrentLength(n);
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeLastChildPtr(n);
+    while (numchildren--) {
+        raxNode *child;
+        memcpy(&child, cp, sizeof(child));
+        total += raxRecursiveComputeLogicalSize(child);
+        cp--;
+    }
+    return total;
+}
+
+size_t raxComputeLogicalSize(rax *rax) {
+    return sizeof(*rax) + raxRecursiveComputeLogicalSize(rax->head);
 }
 
 /* ----------------------------- Introspection ------------------------------ */
