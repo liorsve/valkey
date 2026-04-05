@@ -802,9 +802,29 @@ static inline hashtable *vsetBucketHashtable(vsetBucket *b) {
     return (hashtable *)vsetBucketRawPtr(b);
 }
 
-static inline rax *vsetBucketRax(vsetBucket *b) {
+
+/* Wrapper around rax for RAX-encoded vset buckets. Holds tracking
+ * counters so vsetMemUsage can be O(1) instead of iterating all inner
+ * buckets. The tagged VSET_BUCKET_RAX pointer points to this struct.
+ *
+ * tracked_data_bytes covers only the vset container overhead (pVector
+ * headers + pointer arrays, hashtable bucket arrays). The actual entry
+ * data is owned and counted by the hash's hashtable tracking, not here. */
+typedef struct vsetRaxState {
+    rax *r;
+    size_t tracked_data_bytes;   /* Sum of inner bucket logical sizes
+                                  * (sizeof(pVector) + len*sizeof(void*) for VECTOR,
+                                  * hashtableMemUsage for HT). */
+    size_t tracked_rax_overhead; /* Auto via external_logical_size */
+} vsetRaxState;
+
+static inline vsetRaxState *vsetBucketRaxState(vsetBucket *b) {
     assert(vsetBucketType(b) == VSET_BUCKET_RAX);
-    return (rax *)vsetBucketRawPtr(b);
+    return (vsetRaxState *)vsetBucketRawPtr(b);
+}
+
+static inline rax *vsetBucketRax(vsetBucket *b) {
+    return vsetBucketRaxState(b)->r;
 }
 
 static inline void *vsetBucketSingle(vsetBucket *b) {
@@ -834,7 +854,25 @@ static inline vsetBucket *vsetBucketFromNone(void) {
 }
 
 static inline vsetBucket *vsetBucketFromRax(rax *r) {
-    return vsetBucketFromRawPtr(r, VSET_BUCKET_RAX);
+    vsetRaxState *state = zmalloc(sizeof(*state));
+    state->r = r;
+    state->tracked_data_bytes = 0;
+    state->tracked_rax_overhead = 0;
+    raxSetExternalLogicalSize(r, &state->tracked_rax_overhead);
+    return vsetBucketFromRawPtr(state, VSET_BUCKET_RAX);
+}
+
+static inline size_t vsetInnerBucketDataSize(vsetBucket *bucket) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE: return 0;
+    case VSET_BUCKET_SINGLE: return 0;
+    case VSET_BUCKET_VECTOR: {
+        pVector *pv = vsetBucketVector(bucket);
+        return sizeof(pVector) + pvLen(pv) * sizeof(void *);
+    }
+    case VSET_BUCKET_HT: return hashtableMemUsage(vsetBucketHashtable(bucket));
+    default: return 0;
+    }
 }
 
 /****************** Helper Functions *******************************************/
@@ -1108,9 +1146,12 @@ static void freeVsetBucket(vsetBucket *bucket) {
     case VSET_BUCKET_HT:
         hashtableRelease(vsetBucketHashtable(bucket));
         break;
-    case VSET_BUCKET_RAX:
-        raxFreeWithCallback(vsetBucketRax(bucket), freeVsetBucket);
+    case VSET_BUCKET_RAX: {
+        vsetRaxState *state = vsetBucketRaxState(bucket);
+        raxFreeWithCallback(state->r, freeVsetBucket);
+        zfree(state);
         break;
+    }
     default:
         panic("Unknown volatile set type in freeVsetBucket");
     }
@@ -1127,6 +1168,8 @@ static bool splitBucketIfPossible(vsetBucket *parent, vsetGetExpiryFunc getExpir
     vsetBucket *new_bucket = vsetBucketFromNone();
     pVector *pv = vsetBucketVector(bucket);
     rax *expiry_buckets = vsetBucketRax(parent);
+    vsetRaxState *state = vsetBucketRaxState(parent);
+    size_t old_size = vsetInnerBucketDataSize(bucket);
     /* first lets sort the vector. we cannot take a decision without it.
      * We set the global expiry getter so we can sort according to the provided getExpiry function.
      * TODO: After some thought I think it might be better to avoid sorting and attempt a quickselect. just allocate a new vector with the same size.
@@ -1144,6 +1187,7 @@ static bool splitBucketIfPossible(vsetBucket *parent, vsetGetExpiryFunc getExpir
         assert(raxRemove(expiry_buckets, key, key_len, (void **)&new_bucket));
         assert(new_bucket == bucket);
         target_bucket_ts = max_bucket_ts;
+        /* RELOCATE path: same bucket moved to a new key, zero data delta */
 
     } else if (min_bucket_ts != max_bucket_ts) {
         /* lets split the bucket. we know we can do it. */
@@ -1160,6 +1204,10 @@ static bool splitBucketIfPossible(vsetBucket *parent, vsetGetExpiryFunc getExpir
         /* In order to avoid rax override, we directly change the node data */
         // alternative: raxInsert(*set, key, key_len, bucket, NULL);
         raxSetData(node, bucket);
+        /* SPLIT path: one vector became two, track the delta */
+        size_t bucket_size = vsetInnerBucketDataSize(bucket);
+        size_t new_bucket_size = vsetInnerBucketDataSize(new_bucket);
+        state->tracked_data_bytes += bucket_size + new_bucket_size - old_size;
 
     } else {
         /* We cannot split the bucket. just return false */
@@ -1235,8 +1283,10 @@ static inline vsetBucket *insertToBucket_RAX(vsetGetExpiryFunc getExpiry, vsetBu
     size_t key_len;
     long long bucket_ts;
     rax *expiry_buckets = vsetBucketRax(target);
+    vsetRaxState *state = vsetBucketRaxState(target);
     raxNode *node;
     vsetBucket *bucket = findBucket(expiry_buckets, expiry, key, &key_len, &bucket_ts, &node);
+    size_t old_size = vsetInnerBucketDataSize(bucket);
     int type = vsetBucketType(bucket);
     if (type == VSET_BUCKET_NONE) {
         /* No bucket: create single-entry bucket */
@@ -1244,6 +1294,7 @@ static inline vsetBucket *insertToBucket_RAX(vsetGetExpiryFunc getExpiry, vsetBu
         assert(vsetBucketType(bucket) == VSET_BUCKET_SINGLE);
         size_t key_size = encodeNewExpiryBucketKey(key, expiry);
         raxInsert(expiry_buckets, key, key_size, bucket, NULL);
+        /* SINGLE has zero data size, no delta to track */
         return target;
     } else if (type == VSET_BUCKET_SINGLE) {
         /* Upgrade to vector */
@@ -1264,21 +1315,25 @@ static inline vsetBucket *insertToBucket_RAX(vsetGetExpiryFunc getExpiry, vsetBu
                 // alternative raxInsert(expiry_buckets, key, key_len, bucket, NULL);
                 raxSetData(node, bucket);
             } else {
-                /* we split the bucket. go and find again a bucket to place the entry since there can be new options now. */
+                /* we split the bucket. go and find again a bucket to place the entry since there can be new options now.
+                 * splitBucketIfPossible handles its own tracking, return early. */
                 return insertToBucket_RAX(getExpiry, target, entry, expiry);
             }
         } else {
             vsetBucket *new_bucket = insertToBucket_VECTOR(getExpiry, bucket, entry, expiry, -1);
-            if (new_bucket != bucket)
+            if (new_bucket != bucket) {
                 /* In order to avoid rax override, we directly change the node data */
                 // alternative: raxInsert(expiry_buckets, key, key_len, new_bucket, NULL);
                 raxSetData(node, new_bucket);
+                bucket = new_bucket;
+            }
         }
     } else if (vsetBucketType(bucket) == VSET_BUCKET_HT) {
         bucket = insertToBucket_HASHTABLE(getExpiry, bucket, entry, expiry);
     } else {
         panic("Unknown bucket type in insertToBucket_RAX");
     }
+    state->tracked_data_bytes += vsetInnerBucketDataSize(bucket) - old_size;
     return target;
 }
 
@@ -1364,6 +1419,8 @@ static inline vsetBucket *removeFromBucket_HASHTABLE(vsetGetExpiryFunc getExpiry
 }
 static bool removeEntryFromRaxBucket(vsetBucket *rax_bucket, vsetGetExpiryFunc getExpiry, void *entry, vsetBucket *bucket, unsigned char *key, size_t key_len, vsetBucket **pbucket, raxNode *node) {
     bool removed = false;
+    vsetRaxState *state = vsetBucketRaxState(rax_bucket);
+    size_t old_size = vsetInnerBucketDataSize(bucket);
     switch (vsetBucketType(bucket)) {
     case VSET_BUCKET_SINGLE:
         bucket = removeFromBucket_SINGLE(getExpiry, bucket, entry, 0, &removed);
@@ -1384,6 +1441,7 @@ static bool removeEntryFromRaxBucket(vsetBucket *rax_bucket, vsetGetExpiryFunc g
                 raxSetData(node, new_bucket);
                 if (pbucket) *pbucket = new_bucket;
             }
+            bucket = new_bucket;
         }
         break;
     }
@@ -1395,12 +1453,14 @@ static bool removeEntryFromRaxBucket(vsetBucket *rax_bucket, vsetGetExpiryFunc g
             raxSetData(node, new_bucket);
 
         if (pbucket) *pbucket = new_bucket;
+        bucket = new_bucket;
         break;
     }
     default:
         panic("Unknown bucket type for removeEntryFromRaxBucket");
         return false;
     }
+    if (removed) state->tracked_data_bytes -= old_size - vsetInnerBucketDataSize(bucket);
     return removed;
 }
 
@@ -1426,8 +1486,10 @@ static inline bool shrinkRaxBucketIfPossible(vsetBucket **target, vsetGetExpiryF
                 vsetUnsetExpiryGetter();
             }
             /* lets make our bucket to be the only left bucket */
+            vsetRaxState *state = vsetBucketRaxState(*target);
             *target = bucket;
             raxFree(expiry_buckets);
+            zfree(state);
             return true;
         }
     }
@@ -1517,6 +1579,7 @@ static inline size_t vsetBucketRemoveExpired_HASHTABLE(vsetBucket **bucket, vset
 static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx) {
     UNUSED(getExpiry);
     rax *buckets = vsetBucketRax(*bucket);
+    vsetRaxState *state = vsetBucketRaxState(*bucket);
     size_t count = 0;
     while (count < max_count && raxSize(buckets) > 0) {
         raxIterator it;
@@ -1534,6 +1597,7 @@ static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExp
         raxStop(&it);
         if (time_bucket_ts > now)
             break;
+        size_t old_size = vsetInnerBucketDataSize(time_bucket);
         switch (time_bucket_type) {
         case VSET_BUCKET_SINGLE:
             count += vsetBucketRemoveExpired_SINGLE(&time_bucket, vsetGetExpiryZero, expiryFunc, now, max_count - count, ctx);
@@ -1547,6 +1611,7 @@ static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExp
         default:
             panic("Cannot expire entries from bucket which is not single, vector or hashtable");
         }
+        state->tracked_data_bytes -= old_size - vsetInnerBucketDataSize(time_bucket);
         if (time_bucket == VSET_NONE_BUCKET_PTR) {
             /* in case the bucket is freed, we can just remove it and continue to the next bucket. */
             raxRemove(buckets, key, key_len, NULL);
@@ -1560,6 +1625,7 @@ static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExp
     /* if all buckets are removed, */
     if (raxSize(buckets) == 0) {
         raxFree(buckets);
+        zfree(state);
         *bucket = vsetBucketFromNone();
     } else {
         shrinkRaxBucketIfPossible(bucket, getExpiry);
@@ -1682,7 +1748,7 @@ static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
             total_mem += vsetBucketMemUsage_HASHTABLE(it.data);
             break;
         default:
-            panic("Unknown bucket type encountered in vsetBucketMemUsage_HASHTABLE");
+            panic("Unknown bucket type encountered in vsetBucketMemUsage_RAX");
         }
     }
     raxStop(&it);
@@ -1759,10 +1825,12 @@ bool vsetAddEntry(vset *set, vsetGetExpiryFunc getExpiry, void *entry) {
             long long max_expiry = getExpiry(pvGet(vec, len - 1));
             if (get_max_bucket_ts(min_expiry) == get_max_bucket_ts(max_expiry)) {
                 /* In case we can just insert the bucket, no need to iterate and insert it's elements. we can just push the bucket as a whole. */
+                size_t existing_data = vsetInnerBucketDataSize(expiry_buckets);
                 unsigned char key[VSET_BUCKET_KEY_LEN] = {0};
                 size_t key_len = encodeNewExpiryBucketKey(key, max_expiry);
                 raxInsert(r, key, key_len, expiry_buckets, NULL);
                 expiry_buckets = vsetBucketFromRax(r);
+                vsetBucketRaxState(expiry_buckets)->tracked_data_bytes = existing_data;
                 expiry_buckets = insertToBucket_RAX(getExpiry, expiry_buckets, entry, expiry);
             } else {
                 /* We need to migrate entries to the new set of buckets since we do not know all entries are in the same bucket */
@@ -2217,6 +2285,22 @@ size_t vsetMemUsage(vset *set) {
     return 0;
 }
 
+int vsetVerifyTracking(vset *set, char *errmsg, size_t errlen) {
+    if (vsetBucketType(*set) != VSET_BUCKET_RAX) return 1;
+    vsetRaxState *state = vsetBucketRaxState(*set);
+    size_t walk = 0;
+    raxIterator it;
+    raxStart(&it, state->r);
+    raxSeek(&it, "^", NULL, 0);
+    while (raxNext(&it)) walk += vsetInnerBucketDataSize(it.data);
+    raxStop(&it);
+    if (state->tracked_data_bytes != walk) {
+        snprintf(errmsg, errlen, "vset tracked_data_bytes mismatch: tracked=%zu walk=%zu", state->tracked_data_bytes, walk);
+        return 0;
+    }
+    return 1;
+}
+
 /* Initializes a volatile set iterator.
  *
  * This function prepares the iterator for scanning a volatile set from the beginning.
@@ -2357,7 +2441,7 @@ static size_t vsetBucketDefrag_RAX(vsetBucket **bucket, size_t cursor, void *(*d
         state = &defragState;
         state->bucket_ts = -1;
         state->bucket_cursor = 0;
-        if ((r = defragfn(r))) *bucket = vsetBucketFromRax(r);
+        if ((r = defragfn(r))) vsetBucketRaxState(*bucket)->r = r;
         r = vsetBucketRax(*bucket);
     }
     raxStart(&ri, r);
@@ -2437,8 +2521,18 @@ size_t vsetScanDefrag(vset *set, size_t cursor, void *(*defragfn)(void *)) {
         return 0;
     case VSET_BUCKET_VECTOR:
         return vsetBucketDefrag_VECTOR(set, cursor, defragfn);
-    case VSET_BUCKET_RAX:
+    case VSET_BUCKET_RAX: {
+        vsetRaxState *state = vsetBucketRaxState(*set);
+        vsetRaxState *newstate = defragfn(state);
+        if (newstate) {
+            /* Update the rax's external pointer to the new wrapper location.
+             * Do NOT call raxSetExternalLogicalSize here -- it would add the
+             * tree size again. Just update the pointer directly. */
+            newstate->r->external_logical_size = &newstate->tracked_rax_overhead;
+            *set = vsetBucketFromRawPtr(newstate, VSET_BUCKET_RAX);
+        }
         return vsetBucketDefrag_RAX(set, cursor, defragfn, defragRaxNode);
+    }
     default:
         panic("Unknown vset node type to defrag");
     }
