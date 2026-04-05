@@ -33,6 +33,7 @@
 #include "crc64.h"
 #include "bio.h"
 #include "quicklist.h"
+#include "stream.h"
 #include "fpconv_dtoa.h"
 #include "cluster.h"
 #include "threads_mngr.h"
@@ -995,6 +996,18 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-disable-deny-scripts") && c->argc == 3) {
         server.script_disable_deny_script = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "stream-verify-tracking") && c->argc == 3) {
+        robj *o = lookupKeyRead(c->db, c->argv[2]);
+        if (o == NULL || o->type != OBJ_STREAM) {
+            addReplyError(c, "No such stream key");
+        } else {
+            char errmsg[256];
+            if (streamVerifyTracking(objectGetVal(o), errmsg, sizeof(errmsg))) {
+                addReply(c, shared.ok);
+            } else {
+                addReplyError(c, errmsg);
+            }
+        }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "config-rewrite-force-all") && c->argc == 2) {
         if (rewriteConfig(server.configfile, 1) == -1)
             addReplyErrorFormat(c, "CONFIG-REWRITE-FORCE-ALL failed: %s", strerror(errno));

@@ -193,12 +193,27 @@ rax *raxNew(void) {
     rax->numnodes = 1;
     rax->head = raxNewNode(0, 0);
     rax->alloc_size = rax_ptr_alloc_size(rax) + rax_ptr_alloc_size(rax->head);
+    rax->external_logical_size = NULL;
     if (rax->head == NULL) {
         rax_free(rax);
         return NULL;
     } else {
         return rax;
     }
+}
+
+/* Set external pointer for logical size aggregation. When non-NULL, every
+ * rax mutation propagates its logical size delta (using raxNodeCurrentLength)
+ * to *ptr. The current tree's logical size is added immediately so the
+ * external counter reflects this tree from the moment of attachment. */
+void raxSetExternalLogicalSize(rax *rax, size_t *ptr) {
+    rax->external_logical_size = ptr;
+    if (ptr) *ptr += sizeof(*rax) + raxNodeCurrentLength(rax->head);
+}
+
+/* Propagate a logical size delta to the external counter, if set. */
+static inline void raxExternalOverheadDelta(rax *rax, int64_t delta) {
+    if (rax->external_logical_size) *rax->external_logical_size += delta;
 }
 
 /* realloc the node to make room for auxiliary data in order
@@ -512,10 +527,12 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Make space for the value pointer if needed. */
         if (!h->iskey || (h->isnull && overwrite)) {
             size_t oldalloc = rax_ptr_alloc_size(h);
+            size_t oldlogical = raxNodeCurrentLength(h);
             h = raxReallocForData(h, data);
             if (h) {
                 memcpy(parentlink, &h, sizeof(h));
                 rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h);
+                raxExternalOverheadDelta(rax, (int64_t)(raxNodeCurrentLength(h) - oldlogical));
             }
         }
         if (h == NULL) {
@@ -534,6 +551,10 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Otherwise set the node as a key. Note that raxSetData()
          * will set h->iskey. */
         raxSetData(h, data);
+        /* raxSetData sets iskey=1/isnull=0, adding sizeof(void*) to the
+         * logical length. The realloc delta above was computed before the
+         * flags changed, so propagate the difference now. */
+        raxExternalOverheadDelta(rax, sizeof(void *));
         rax->numele++;
         return 1; /* Element inserted. */
     }
@@ -712,6 +733,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         }
         splitnode->data[0] = h->data[j];
         rax->alloc_size += rax_ptr_alloc_size(splitnode);
+        raxExternalOverheadDelta(rax, raxNodeCurrentLength(splitnode));
 
         if (j == 0) {
             /* 3a: Replace the old node with the split node. */
@@ -737,6 +759,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             parentlink = cp; /* Set parentlink to splitnode parent. */
             rax->numnodes++;
             rax->alloc_size += rax_ptr_alloc_size(trimmed);
+            raxExternalOverheadDelta(rax, raxNodeCurrentLength(trimmed));
         }
 
         /* 4: Create the postfix node: what remains of the original
@@ -752,6 +775,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             memcpy(cp, &next, sizeof(next));
             rax->numnodes++;
             rax->alloc_size += rax_ptr_alloc_size(postfix);
+            raxExternalOverheadDelta(rax, raxNodeCurrentLength(postfix));
         } else {
             /* 4b: just use next as postfix node. */
             postfix = next;
@@ -764,6 +788,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* 6. Continue insertion: this will cause the splitnode to
          * get a new child (the non common character at the currently
          * inserted key). */
+        raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(h));
         rax->alloc_size -= rax_ptr_alloc_size(h);
         rax_free(h);
         h = splitnode;
@@ -804,6 +829,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         memcpy(cp, &next, sizeof(next));
         rax->numnodes++;
         rax->alloc_size += rax_ptr_alloc_size(postfix);
+        raxExternalOverheadDelta(rax, raxNodeCurrentLength(postfix));
 
         /* 3: Trim the compressed node. */
         trimmed->size = j;
@@ -817,6 +843,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
             raxSetData(trimmed, aux);
         }
         rax->alloc_size += rax_ptr_alloc_size(trimmed);
+        raxExternalOverheadDelta(rax, raxNodeCurrentLength(trimmed));
 
         /* Fix the trimmed node child pointer to point to
          * the postfix node. */
@@ -826,6 +853,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         /* Finish! We don't need to continue with the insertion
          * algorithm for ALGO 2. The key is already inserted. */
         rax->numele++;
+        raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(h));
         rax->alloc_size -= rax_ptr_alloc_size(h);
         rax_free(h);
         return 1; /* Key inserted. */
@@ -836,6 +864,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
     while (i < len) {
         raxNode *child;
         size_t oldalloc = rax_ptr_alloc_size(h);
+        size_t oldlogical = raxNodeCurrentLength(h);
 
         /* If this node is going to have a single child, and there
          * are other characters, so that that would result in a chain
@@ -862,9 +891,11 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
         }
         rax->numnodes++;
         rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h) + rax_ptr_alloc_size(child);
+        raxExternalOverheadDelta(rax, (int64_t)(raxNodeCurrentLength(h) + raxNodeCurrentLength(child) - oldlogical));
         h = child;
     }
     size_t oldalloc = rax_ptr_alloc_size(h);
+    size_t oldlogical = raxNodeCurrentLength(h);
     raxNode *newh = raxReallocForData(h, data);
     if (newh == NULL) goto oom;
     h = newh;
@@ -872,6 +903,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
     raxSetData(h, data);
     memcpy(parentlink, &h, sizeof(h));
     rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(h);
+    raxExternalOverheadDelta(rax, (int64_t)(raxNodeCurrentLength(h) - oldlogical));
     return 1; /* Element inserted. */
 
 oom:
@@ -1022,6 +1054,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         return 0;
     }
     if (old) *old = raxGetData(h);
+    if (!h->isnull) raxExternalOverheadDelta(rax, -(int64_t)sizeof(void *));
     h->iskey = 0;
     rax->numele--;
 
@@ -1041,6 +1074,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
             child = h;
             debugf("Freeing child %p [%.*s] key:%d\n", (void *)child, (int)child->size, (char *)child->data,
                    child->iskey);
+            raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(child));
             rax->alloc_size -= rax_ptr_alloc_size(child);
             rax_free(child);
             rax->numnodes--;
@@ -1052,8 +1086,10 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         if (child) {
             debugf("Unlinking child %p from parent %p\n", (void *)child, (void *)h);
             size_t oldalloc = rax_ptr_alloc_size(h);
+            size_t oldlogical = raxNodeCurrentLength(h);
             raxNode *new = raxRemoveChild(h, child);
             rax->alloc_size = rax->alloc_size - oldalloc + rax_ptr_alloc_size(new);
+            raxExternalOverheadDelta(rax, (int64_t)(raxNodeCurrentLength(new) - oldlogical));
             if (new != h) {
                 raxNode *parent = raxStackPeek(&ts);
                 raxNode **parentlink;
@@ -1171,6 +1207,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
             new->size = comprsize;
             rax->numnodes++;
             rax->alloc_size += rax_ptr_alloc_size(new);
+            raxExternalOverheadDelta(rax, raxNodeCurrentLength(new));
 
             /* Scan again, this time to populate the new node content and
              * to fix the new node child pointer. At the same time we free
@@ -1183,6 +1220,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
                 raxNode **cp = raxNodeLastChildPtr(h);
                 raxNode *tofree = h;
                 memcpy(&h, cp, sizeof(h));
+                raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(tofree));
                 rax->alloc_size -= rax_ptr_alloc_size(tofree);
                 rax_free(tofree);
                 rax->numnodes--;
@@ -1225,6 +1263,7 @@ void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void *)) {
     }
     debugnode("free depth-first", n);
     if (free_callback && n->iskey && !n->isnull) free_callback(raxGetData(n));
+    raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(n));
     rax_free(n);
     rax->numnodes--;
 }
@@ -1234,6 +1273,34 @@ void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void *)) {
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void *)) {
     raxRecursiveFree(rax, rax->head, free_callback);
     assert(rax->numnodes == 0);
+    raxExternalOverheadDelta(rax, -(int64_t)sizeof(*rax));
+    rax_free(rax);
+}
+
+/* Same as raxRecursiveFree but the callback receives a context pointer. */
+static void raxRecursiveFreeWithContext(rax *rax, raxNode *n, void (*free_callback)(void *data, void *ctx), void *ctx) {
+    debugnode("free traversing", n);
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeLastChildPtr(n);
+    while (numchildren--) {
+        raxNode *child;
+        memcpy(&child, cp, sizeof(child));
+        raxRecursiveFreeWithContext(rax, child, free_callback, ctx);
+        cp--;
+    }
+    debugnode("free depth-first", n);
+    if (free_callback && n->iskey && !n->isnull) free_callback(raxGetData(n), ctx);
+    raxExternalOverheadDelta(rax, -(int64_t)raxNodeCurrentLength(n));
+    rax_free(n);
+    rax->numnodes--;
+}
+
+/* Free a whole radix tree, calling the specified callback with context
+ * in order to free the auxiliary data. */
+void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx) {
+    raxRecursiveFreeWithContext(rax, rax->head, free_callback, ctx);
+    assert(rax->numnodes == 0);
+    raxExternalOverheadDelta(rax, -(int64_t)sizeof(*rax));
     rax_free(rax);
 }
 
@@ -1789,6 +1856,25 @@ uint64_t raxSize(rax *rax) {
 /* Return the rax tree allocation size in bytes */
 size_t raxAllocSize(rax *rax) {
     return rax->alloc_size;
+}
+
+/* Compute the total logical size of a rax tree by walking all nodes.
+ * O(n) — intended for testing/verification only. */
+static size_t raxRecursiveComputeLogicalSize(raxNode *n) {
+    size_t total = raxNodeCurrentLength(n);
+    int numchildren = n->iscompr ? 1 : n->size;
+    raxNode **cp = raxNodeLastChildPtr(n);
+    while (numchildren--) {
+        raxNode *child;
+        memcpy(&child, cp, sizeof(child));
+        total += raxRecursiveComputeLogicalSize(child);
+        cp--;
+    }
+    return total;
+}
+
+size_t raxComputeLogicalSize(rax *rax) {
+    return sizeof(*rax) + raxRecursiveComputeLogicalSize(rax->head);
 }
 
 /* ----------------------------- Introspection ------------------------------ */

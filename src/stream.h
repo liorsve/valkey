@@ -21,6 +21,10 @@ typedef struct stream {
     streamID first_id;             /* The first non-tombstone entry, zero if empty. */
     streamID max_deleted_entry_id; /* The maximal ID that was deleted. */
     uint64_t entries_added;        /* All time count of elements added. */
+    size_t tracked_data_bytes;     /* Listpack bytes + consumer name SDS bytes +
+                                    * sizeof(streamCG/NACK/Consumer) for all structs. */
+    size_t tracked_overhead;       /* Rax node overhead only (auto via
+                                    * external_logical_size). */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without
@@ -156,5 +160,9 @@ void streamGetEdgeID(stream *s, int first, int skip_tombstones, streamID *edge_i
 long long streamEstimateDistanceFromFirstEverEntry(stream *s, streamID *id);
 int64_t streamTrimByLength(stream *s, long long maxlen, int approx);
 int64_t streamTrimByID(stream *s, streamID minid, int approx);
+int streamVerifyTracking(stream *s, char *errmsg, size_t errlen);
+void streamFreeNACKWithTracking(void *data, void *ctx);
+void streamFreeConsumerWithTracking(void *data, void *ctx);
+void streamFreeCGWithTracking(void *data, void *ctx);
 
 #endif
