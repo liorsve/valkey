@@ -91,6 +91,7 @@ bool vsetIsValid(vset *set);
 long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry);
 size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx);
 size_t vsetMemUsage(vset *set);
+int vsetVerifyTracking(vset *set, char *errmsg, size_t errlen);
 size_t vsetScanDefrag(vset *set, size_t cursor, void *(*defragfn)(void *));
 
 #endif

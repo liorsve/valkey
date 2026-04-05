@@ -131,10 +131,12 @@ typedef struct raxNode {
 } raxNode;
 
 typedef struct rax {
-    raxNode *head;     /* Pointer to root node of tree */
-    uint64_t numele;   /* Number of keys in the tree */
-    uint64_t numnodes; /* Number of rax nodes in the tree */
-    size_t alloc_size; /* Total allocation size of the tree in bytes */
+    raxNode *head;       /* Pointer to root node of tree */
+    uint64_t numele;     /* Number of keys in the tree */
+    uint64_t numnodes;   /* Number of rax nodes in the tree */
+    size_t alloc_size;   /* Total allocation size of the tree in bytes */
+    size_t logical_size; /* Total logical size of all rax nodes, using
+                          * raxNodeCurrentLength (no zmalloc_size calls). */
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -194,6 +196,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
 int raxFind(rax *rax, unsigned char *s, size_t len, void **value);
 void raxFree(rax *rax);
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void *));
+void raxFreeWithCallbackAndContext(rax *rax, void (*free_callback)(void *data, void *ctx), void *ctx);
 void raxStart(raxIterator *it, rax *rt);
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
 int raxNext(raxIterator *it);
@@ -205,6 +208,8 @@ int raxEOF(raxIterator *it);
 void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 size_t raxAllocSize(rax *rax);
+size_t raxLogicalSize(rax *rax);
+size_t raxComputeLogicalSize(rax *rax);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
 
