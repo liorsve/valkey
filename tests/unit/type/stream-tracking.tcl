@@ -7,7 +7,7 @@ proc verify_stream_tracking {key} {
     assert_equal $result "OK"
 }
 
-start_server {tags {"stream"}} {
+start_server {tags {"stream needs:debug"}} {
     test {XADD tracking} {
         r DEL mystream
         for {set i 0} {$i < 100} {incr i} {

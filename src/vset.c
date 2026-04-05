@@ -1753,11 +1753,6 @@ static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
     return total_mem;
 }
 
-/* O(1) logical size — uses tracked counters instead of walking. */
-static inline size_t vsetBucketLogicalSize_RAX(vsetBucket *bucket) {
-    vsetRaxState *state = vsetBucketRaxState(bucket);
-    return sizeof(vsetRaxState) + raxLogicalSize(state->r) + state->tracked_data_bytes;
-}
 
 /* Adds an entry to a volatile set (vset) based on its expiration time.
  *

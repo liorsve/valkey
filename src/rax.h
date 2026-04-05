@@ -131,10 +131,10 @@ typedef struct raxNode {
 } raxNode;
 
 typedef struct rax {
-    raxNode *head;     /* Pointer to root node of tree */
-    uint64_t numele;   /* Number of keys in the tree */
-    uint64_t numnodes; /* Number of rax nodes in the tree */
-    size_t alloc_size; /* Total allocation size of the tree in bytes */
+    raxNode *head;       /* Pointer to root node of tree */
+    uint64_t numele;     /* Number of keys in the tree */
+    uint64_t numnodes;   /* Number of rax nodes in the tree */
+    size_t alloc_size;   /* Total allocation size of the tree in bytes */
     size_t logical_size; /* Total logical size of all rax nodes, using
                           * raxNodeCurrentLength (no zmalloc_size calls). */
 } rax;

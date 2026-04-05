@@ -99,12 +99,12 @@ static size_t computeOverheadWalk(stream *s) {
     return total;
 }
 
-#define ASSERT_STREAM_TRACKING(s)                                           \
-    do {                                                                    \
-        ASSERT_EQ((s)->tracked_data_bytes, computeDataBytesWalk(s))         \
-            << "tracked_data_bytes mismatch";                               \
-        ASSERT_EQ((s)->tracked_overhead, computeOverheadWalk(s))            \
-            << "tracked_overhead mismatch";                                 \
+#define ASSERT_STREAM_TRACKING(s)                                   \
+    do {                                                            \
+        ASSERT_EQ((s)->tracked_data_bytes, computeDataBytesWalk(s)) \
+            << "tracked_data_bytes mismatch";                       \
+        ASSERT_EQ((s)->tracked_overhead, computeOverheadWalk(s))    \
+            << "tracked_overhead mismatch";                         \
     } while (0)
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
@@ -417,8 +417,8 @@ TEST_F(StreamTrackingTest, DestroyConsumerGroup) {
     raxRemove(s->cgroups, (unsigned char *)"grp2", 4, NULL);
     s->tracked_data_bytes -= sizeof(streamCG);
     s->tracked_overhead -= raxLogicalSize(cg2->pel) +
-                               raxLogicalSize(cg2->consumers) +
-                               (cgroups_before - raxLogicalSize(s->cgroups));
+                           raxLogicalSize(cg2->consumers) +
+                           (cgroups_before - raxLogicalSize(s->cgroups));
     raxFreeWithCallbackAndContext(cg2->pel, streamFreeNACKWithTracking, s);
     raxFreeWithCallbackAndContext(cg2->consumers, streamFreeConsumerWithTracking, s);
     zfree(cg2);
@@ -549,6 +549,7 @@ TEST_F(StreamTrackingTest, StreamDup) {
     ASSERT_EQ(s->tracked_overhead, new_s->tracked_overhead);
 
     objectSetVal(orig, NULL); /* prevent double-free of s */
+    decrRefCount(orig);
     decrRefCount(copy);
     sdsfree(name);
     decrRefCount(key);

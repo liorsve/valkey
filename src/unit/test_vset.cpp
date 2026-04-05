@@ -482,11 +482,11 @@ TEST_F(VsetTest, TestVsetFuzzer) {
 
 /* ── Tracking tests ─────────────────────────────────────────────────── */
 
-#define ASSERT_VSET_TRACKING(set)                                     \
-    do {                                                              \
-        char errmsg[256];                                             \
-        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg)))  \
-            << errmsg;                                                \
+#define ASSERT_VSET_TRACKING(set)                                    \
+    do {                                                             \
+        char errmsg[256];                                            \
+        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg))) \
+            << errmsg;                                               \
     } while (0)
 
 /* Force promotion to RAX by inserting enough entries */
