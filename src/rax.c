@@ -1259,8 +1259,7 @@ void raxFreeWithCallback(rax *rax, void (*free_callback)(void *)) {
 }
 
 /* Same as raxRecursiveFree but the callback receives a context pointer. */
-static void raxRecursiveFreeWithContext(rax *rax, raxNode *n,
-                                        void (*free_callback)(void *data, void *ctx), void *ctx) {
+static void raxRecursiveFreeWithContext(rax *rax, raxNode *n, void (*free_callback)(void *data, void *ctx), void *ctx) {
     debugnode("free traversing", n);
     int numchildren = n->iscompr ? 1 : n->size;
     raxNode **cp = raxNodeLastChildPtr(n);
