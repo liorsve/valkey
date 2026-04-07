@@ -27,6 +27,7 @@ extern "C" {
 #include "hashtable.h"
 #include "sds.h"
 #include "server.h"
+#include "vset.h"
 #include "zmalloc.h"
 }
 
@@ -60,7 +61,7 @@ static size_t computeEntrySize(const entry *e) {
     return size;
 }
 
-/* Walk all entries and sum independently-computed logical sizes. */
+/* Walk all entries and sum independently-computed logical sizes (data). */
 static size_t computeExpectedDataBytes(hashtable *ht) {
     size_t total = 0;
     hashtableIterator iter;
@@ -73,11 +74,44 @@ static size_t computeExpectedDataBytes(hashtable *ht) {
     return total;
 }
 
-#define ASSERT_TRACKED_CORRECT(ht)                          \
-    do {                                                    \
-        size_t _expected = computeExpectedDataBytes(ht);    \
-        ASSERT_EQ(hashtableTrackedDataBytes(ht), _expected) \
-            << "tracked_data_bytes mismatch";               \
+/* Compute expected overhead: hashtable container + vset container.
+ * Uses O(1) hashtableMemUsage (deterministic formula) and O(n)
+ * vsetComputeLogicalSize (independent walk, testing only). */
+static size_t computeExpectedOverhead(robj *o) {
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+    size_t total = hashtableMemUsage(ht);
+    vset *volatile_fields = static_cast<vset *>(hashtableMetadata(ht));
+    if (vsetIsValid(volatile_fields)) {
+        total += vsetComputeLogicalSize(volatile_fields);
+    }
+    return total;
+}
+
+/* Verify tracked entry data matches independent walk. */
+#define ASSERT_TRACKED_DATA_CORRECT(ht)          \
+    do {                                         \
+        ASSERT_EQ(hashtableTrackedDataBytes(ht), \
+                  computeExpectedDataBytes(ht))  \
+            << "tracked_data_bytes mismatch";    \
+    } while (0)
+
+/* Verify overhead (hashtable container + vset container) matches
+ * independent walk. computeExpectedOverhead uses vsetComputeLogicalSize
+ * (O(n) walk) while the right side uses vsetLogicalSize (O(1) tracked). */
+#define ASSERT_TRACKED_OVERHEAD_CORRECT(o, ht)                           \
+    do {                                                                 \
+        vset *_vf = static_cast<vset *>(hashtableMetadata(ht));          \
+        size_t _vset_size = vsetIsValid(_vf) ? vsetLogicalSize(_vf) : 0; \
+        ASSERT_EQ(computeExpectedOverhead(o),                            \
+                  hashtableMemUsage(ht) + _vset_size)                    \
+            << "overhead mismatch";                                      \
+    } while (0)
+
+/* Assert both data tracking and overhead. */
+#define ASSERT_HASH_LOGICAL_SIZE(o, ht)         \
+    do {                                        \
+        ASSERT_TRACKED_DATA_CORRECT(ht);        \
+        ASSERT_TRACKED_OVERHEAD_CORRECT(o, ht); \
     } while (0)
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
@@ -121,7 +155,7 @@ TEST_F(HashTrackingTest, AddNewFields) {
         snprintf(f, sizeof(f), "field_%d", i);
         snprintf(v, sizeof(v), "value_%d_%0*d", i, 30, i);
         hashSet(o, f, v);
-        ASSERT_TRACKED_CORRECT(ht);
+        ASSERT_HASH_LOGICAL_SIZE(o, ht);
     }
 
     decrRefCount(o);
@@ -133,15 +167,15 @@ TEST_F(HashTrackingTest, UpdateExistingValue) {
     hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
 
     hashSet(o, "key", "short");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update with a longer value */
     hashSet(o, "key", "a_much_longer_value_that_changes_the_logical_size");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update with a shorter value */
     hashSet(o, "key", "x");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -154,14 +188,14 @@ TEST_F(HashTrackingTest, SetExpiry) {
     /* Add without expiry */
     hashSet(o, "myfield", "myvalue");
     size_t without_expiry = hashtableTrackedDataBytes(ht);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update same field with expiry. Entry transitions from Type 1 (SDS_TYPE_5
      * field, no expiry) to Type 2 (SDS_TYPE_8 field, with expiry).
      * Diff = sizeof(mstime_t) + (sdsHdrSize(SDS_TYPE_8) - sdsHdrSize(SDS_TYPE_5)) */
     hashSetExpiry(o, "myfield", "myvalue", mstime() + 100000);
     size_t with_expiry = hashtableTrackedDataBytes(ht);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
     size_t expected_diff = sizeof(mstime_t) +
                            (static_cast<size_t>(sdsHdrSize(SDS_TYPE_8)) - static_cast<size_t>(sdsHdrSize(SDS_TYPE_5)));
     ASSERT_EQ(with_expiry - without_expiry, expected_diff);
@@ -175,15 +209,15 @@ TEST_F(HashTrackingTest, UpdateValueAndExpiry) {
     hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
 
     hashSet(o, "f1", "val_no_exp");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Add expiry + change value */
     hashSetExpiry(o, "f1", "new_val_with_exp", mstime() + 100000);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Remove expiry by setting again without */
     hashSet(o, "f1", "back_to_no_exp");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -199,13 +233,13 @@ TEST_F(HashTrackingTest, DeleteFields) {
         snprintf(v, sizeof(v), "v_%d", i);
         hashSet(o, f, v);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     for (int i = 0; i < 50; i++) {
         char f[32];
         snprintf(f, sizeof(f), "f_%d", i);
         ASSERT_TRUE(hashDel(o, f));
-        ASSERT_TRACKED_CORRECT(ht);
+        ASSERT_HASH_LOGICAL_SIZE(o, ht);
     }
     ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
 
@@ -222,7 +256,7 @@ TEST_F(HashTrackingTest, DeleteNonexistent) {
 
     ASSERT_FALSE(hashDel(o, "nonexistent"));
     ASSERT_EQ(hashtableTrackedDataBytes(ht), before);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -233,11 +267,11 @@ TEST_F(HashTrackingTest, DuplicateFieldSameValue) {
     hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
 
     hashSet(o, "dup", "val");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Set same field with same value — entry updated in place */
     hashSet(o, "dup", "val");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -249,19 +283,19 @@ TEST_F(HashTrackingTest, VariousSizes) {
 
     /* Small (TYPE_5 field) */
     hashSet(o, "f", "v");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Medium (TYPE_8) */
     std::string med_f(100, 'F');
     std::string med_v(200, 'V');
     hashSet(o, med_f.c_str(), med_v.c_str());
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Large (TYPE_16) */
     std::string big_f(300, 'G');
     std::string big_v(500, 'W');
     hashSet(o, big_f.c_str(), big_v.c_str());
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -289,7 +323,7 @@ TEST_F(HashTrackingTest, ConvertListpackToHashtable) {
     ASSERT_EQ(o->encoding, static_cast<unsigned int>(OBJ_ENCODING_HASHTABLE));
 
     hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     server.hash_max_listpack_entries = saved;
     server.hash_max_listpack_value = saved_val;
@@ -307,11 +341,11 @@ TEST_F(HashTrackingTest, HashTypeDup) {
         snprintf(v, sizeof(v), "dv_%d", i);
         hashSet(o, f, v);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     robj *copy = hashTypeDup(o);
     hashtable *ht_copy = static_cast<hashtable *>(objectGetVal(copy));
-    ASSERT_TRACKED_CORRECT(ht_copy);
+    ASSERT_HASH_LOGICAL_SIZE(copy, ht_copy);
     ASSERT_EQ(hashtableTrackedDataBytes(ht), hashtableTrackedDataBytes(ht_copy));
 
     decrRefCount(o);
@@ -329,7 +363,7 @@ TEST_F(HashTrackingTest, HashtableEmpty) {
         snprintf(v, sizeof(v), "ev_%d", i);
         hashSet(o, f, v);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     hashtableEmpty(ht, nullptr);
     ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
@@ -349,7 +383,7 @@ TEST_F(HashTrackingTest, InterleavedOperations) {
         snprintf(v, sizeof(v), "v_%04d", i);
         hashSet(o, f, v);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update every other field with a longer value */
     for (int i = 0; i < 200; i += 2) {
@@ -359,7 +393,7 @@ TEST_F(HashTrackingTest, InterleavedOperations) {
         snprintf(v + 100, sizeof(v) - 100, "_%d", i);
         hashSet(o, f, v);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Delete every third field */
     for (int i = 0; i < 200; i += 3) {
@@ -367,7 +401,7 @@ TEST_F(HashTrackingTest, InterleavedOperations) {
         snprintf(f, sizeof(f), "k_%04d", i);
         hashDel(o, f);
     }
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -378,7 +412,7 @@ TEST_F(HashTrackingTest, EmptyHashZeroBytes) {
     hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
 
     ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -391,7 +425,7 @@ TEST_F(HashTrackingTest, EntrySetExpiryAddExpiry) {
 
     /* Add a field without expiry */
     hashSet(o, "persist_field", "some_value");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Simulate hashTypeSetExpire: find entry, set expiry, adjust tracking */
     sds field = sdsnew("persist_field");
@@ -405,7 +439,7 @@ TEST_F(HashTrackingTest, EntrySetExpiryAddExpiry) {
     *eref = entrySetExpiry(e, mstime() + 100000);
     hashtableAdjustTrackedDataBytes(ht, static_cast<ssize_t>(entryGetLogicalSize(static_cast<entry *>(*eref))) -
                                             static_cast<ssize_t>(old_size));
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
     ASSERT_GT(hashtableTrackedDataBytes(ht), before);
 
     sdsfree(field);
@@ -420,7 +454,7 @@ TEST_F(HashTrackingTest, EntrySetExpiryRemoveExpiry) {
 
     /* Add a field with expiry */
     hashSetExpiry(o, "exp_field", "exp_value", mstime() + 100000);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Simulate hashTypePersist: find entry, remove expiry, adjust tracking */
     sds field = sdsnew("exp_field");
@@ -434,7 +468,7 @@ TEST_F(HashTrackingTest, EntrySetExpiryRemoveExpiry) {
     *eref = entrySetExpiry(e, EXPIRY_NONE);
     hashtableAdjustTrackedDataBytes(ht, static_cast<ssize_t>(entryGetLogicalSize(static_cast<entry *>(*eref))) -
                                             static_cast<ssize_t>(old_size));
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
     ASSERT_LT(hashtableTrackedDataBytes(ht), with_expiry);
 
     sdsfree(field);
@@ -448,21 +482,21 @@ TEST_F(HashTrackingTest, UpdateAsStringRef) {
 
     /* Add a regular field first */
     hashSet(o, "ref_field", "initial_value");
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update to a stringRef value */
     const char *buf = "externalized_buffer_data";
     sds field = sdsnew("ref_field");
     hashTypeUpdateAsStringRef(o, field, buf, strlen(buf));
     sdsfree(field);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     /* Update stringRef with different length */
     const char *buf2 = "short";
     field = sdsnew("ref_field");
     hashTypeUpdateAsStringRef(o, field, buf2, strlen(buf2));
     sdsfree(field);
-    ASSERT_TRACKED_CORRECT(ht);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
 
     decrRefCount(o);
 }
@@ -522,7 +556,7 @@ TEST_F(HashTrackingTest, Fuzzer) {
             if (o->encoding == OBJ_ENCODING_HASHTABLE) {
                 robj *copy = hashTypeDup(o);
                 hashtable *ht_copy = static_cast<hashtable *>(objectGetVal(copy));
-                ASSERT_TRACKED_CORRECT(ht_copy);
+                ASSERT_HASH_LOGICAL_SIZE(copy, ht_copy);
                 decrRefCount(copy);
             }
         }
@@ -533,7 +567,7 @@ TEST_F(HashTrackingTest, Fuzzer) {
 
         if (o->encoding == OBJ_ENCODING_HASHTABLE) {
             hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
-            ASSERT_TRACKED_CORRECT(ht);
+            ASSERT_HASH_LOGICAL_SIZE(o, ht);
         }
     }
 
@@ -545,12 +579,226 @@ TEST_F(HashTrackingTest, Fuzzer) {
         while (!fields.empty()) {
             hashDel(o, fields.back().c_str());
             fields.pop_back();
-            ASSERT_TRACKED_CORRECT(ht);
+            ASSERT_HASH_LOGICAL_SIZE(o, ht);
         }
         ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
     }
 
     server.hash_max_listpack_entries = saved;
     server.hash_max_listpack_value = saved_val;
+    decrRefCount(o);
+}
+
+/* Test that hashTypeLogicalSize returns a consistent O(1) value
+ * that accounts for hashtable container + entry data + vset overhead. */
+TEST_F(HashTrackingTest, HashTypeLogicalSize) {
+    int saved = server.hash_max_listpack_entries;
+    server.hash_max_listpack_entries = 0; /* Force hashtable encoding */
+    robj *o = createHashObject();
+
+    /* Add entries without expiry */
+    for (int i = 0; i < 100; i++) {
+        char field[32], value[64];
+        snprintf(field, sizeof(field), "field_%d", i);
+        snprintf(value, sizeof(value), "value_%d_with_some_data", i);
+        hashSet(o, field, value);
+    }
+
+    ASSERT_EQ(o->encoding, (unsigned)OBJ_ENCODING_HASHTABLE);
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+
+    /* Without vset: logical = hashtable container + entry data */
+    size_t logical_no_vset = hashTypeLogicalSize(o);
+    size_t expected_no_vset = hashtableMemUsage(ht) + computeExpectedDataBytes(ht);
+    ASSERT_EQ(logical_no_vset, expected_no_vset);
+    ASSERT_GT(hashtableTrackedDataBytes(ht), 0ul);
+
+    /* Add expiry to some entries — creates vset */
+    mstime_t future = commandTimeSnapshot() + 100000;
+    for (int i = 0; i < 30; i++) {
+        char field[32], value[64];
+        snprintf(field, sizeof(field), "field_%d", i);
+        snprintf(value, sizeof(value), "value_%d_with_some_data", i);
+        hashSetExpiry(o, field, value, future + i);
+    }
+
+    /* With vset: verify tracking is correct and vset contributes */
+    vset *volatile_fields = static_cast<vset *>(hashtableMetadata(ht));
+    ASSERT_TRUE(vsetIsValid(volatile_fields));
+    ASSERT_GT(vsetLogicalSize(volatile_fields), 0ul);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+    /* Delete all entries */
+    for (int i = 0; i < 100; i++) {
+        char field[32];
+        snprintf(field, sizeof(field), "field_%d", i);
+        hashDel(o, field);
+    }
+
+    size_t logical_empty = hashTypeLogicalSize(o);
+    ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
+    ASSERT_EQ(logical_empty, hashtableMemUsage(ht));
+
+    server.hash_max_listpack_entries = saved;
+    decrRefCount(o);
+}
+
+/* Helper: get the vset from a hashtable-encoded hash, or NULL if none. */
+static vset *getVset(robj *o) {
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+    vset *vf = static_cast<vset *>(hashtableMetadata(ht));
+    return vsetIsValid(vf) ? vf : NULL;
+}
+
+/* Test vset SINGLE encoding: 1 entry with expiry.
+ * SINGLE stores the entry pointer directly — zero container overhead. */
+TEST_F(HashTrackingTest, VsetSingleExpiry) {
+    robj *o = createTestHash();
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+
+    /* Add entries, one with expiry */
+    for (int i = 0; i < 10; i++) {
+        char f[32], v[32];
+        snprintf(f, sizeof(f), "field_%d", i);
+        snprintf(v, sizeof(v), "value_%d", i);
+        hashSet(o, f, v);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    ASSERT_EQ(getVset(o), nullptr);
+
+    /* Set expiry on one entry — vset becomes SINGLE (zero container overhead) */
+    hashSetExpiry(o, "field_0", "value_0", mstime() + 100000);
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    ASSERT_NE(getVset(o), nullptr);
+    ASSERT_EQ(vsetLogicalSize(getVset(o)), 0ul) << "SINGLE encoding should have zero container overhead";
+
+    /* Remove the expiry entry */
+    hashDel(o, "field_0");
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+    decrRefCount(o);
+}
+
+/* Test vset VECTOR encoding: 2-127 entries with expiry.
+ * VECTOR stores entries in a pVector — has nonzero container overhead. */
+TEST_F(HashTrackingTest, VsetVectorExpiry) {
+    robj *o = createTestHash();
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+
+    /* Add 50 entries, all with expiry spread across time */
+    mstime_t future = mstime() + 100000;
+    size_t prev_vset_size = 0;
+    for (int i = 0; i < 50; i++) {
+        char f[32], v[32];
+        snprintf(f, sizeof(f), "field_%d", i);
+        snprintf(v, sizeof(v), "value_%d", i);
+        hashSetExpiry(o, f, v, future + i * 100);
+        ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+        size_t cur_vset_size = vsetLogicalSize(getVset(o));
+        if (i == 0) {
+            /* First entry: SINGLE encoding, zero overhead */
+            ASSERT_EQ(cur_vset_size, 0ul) << "1 entry should be SINGLE (zero overhead)";
+        } else {
+            /* 2+ entries: VECTOR encoding, growing overhead */
+            ASSERT_GT(cur_vset_size, 0ul) << "2+ entries should have nonzero vset overhead";
+            ASSERT_GE(cur_vset_size, prev_vset_size) << "vset should grow or stay same";
+        }
+        prev_vset_size = cur_vset_size;
+    }
+
+    /* Delete half — vset should shrink */
+    size_t size_before_delete = vsetLogicalSize(getVset(o));
+    for (int i = 0; i < 25; i++) {
+        char f[32];
+        snprintf(f, sizeof(f), "field_%d", i);
+        hashDel(o, f);
+        ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    }
+    ASSERT_LT(vsetLogicalSize(getVset(o)), size_before_delete);
+
+    /* Delete rest */
+    for (int i = 25; i < 50; i++) {
+        char f[32];
+        snprintf(f, sizeof(f), "field_%d", i);
+        hashDel(o, f);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+    decrRefCount(o);
+}
+
+/* Test vset RAX encoding: 128+ entries with expiry, spread across
+ * different time buckets so the vset promotes from VECTOR to RAX.
+ * RAX has significantly more overhead than VECTOR (rax nodes + wrapper). */
+TEST_F(HashTrackingTest, VsetRaxExpiry) {
+    robj *o = createTestHash();
+    hashtable *ht = static_cast<hashtable *>(objectGetVal(o));
+
+    /* Track vset size as entries are added to observe SINGLE→VECTOR→RAX */
+    mstime_t future = mstime() + 100000;
+    size_t size_at_1 = 0, size_at_50 = 0, size_at_128 = 0, size_at_200 = 0;
+    for (int i = 0; i < 200; i++) {
+        char f[32], v[64];
+        snprintf(f, sizeof(f), "rax_field_%d", i);
+        snprintf(v, sizeof(v), "rax_value_%d_with_padding", i);
+        hashSetExpiry(o, f, v, future + i * 100);
+
+        size_t cur = vsetLogicalSize(getVset(o));
+        if (i == 0) size_at_1 = cur;
+        if (i == 49) size_at_50 = cur;
+        if (i == 127) size_at_128 = cur;
+        if (i == 199) size_at_200 = cur;
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+    /* Verify encoding transitions via size jumps */
+    ASSERT_EQ(size_at_1, 0ul) << "1 entry: SINGLE (zero overhead)";
+    ASSERT_GT(size_at_50, 0ul) << "50 entries: VECTOR (nonzero)";
+    ASSERT_GT(size_at_128, size_at_50) << "128 entries: should be larger (RAX promotion)";
+    ASSERT_GT(size_at_200, size_at_128) << "200 entries: RAX growing";
+
+    /* Add more entries without expiry — vset size unchanged */
+    size_t vset_before_plain = vsetLogicalSize(getVset(o));
+    for (int i = 0; i < 50; i++) {
+        char f[32], v[32];
+        snprintf(f, sizeof(f), "plain_%d", i);
+        snprintf(v, sizeof(v), "plain_val_%d", i);
+        hashSet(o, f, v);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    ASSERT_EQ(vsetLogicalSize(getVset(o)), vset_before_plain)
+        << "plain entries should not change vset size";
+
+    /* Update some expiry entries with new values — entry size changes
+     * but vset container stays same (same keys, same buckets) */
+    size_t vset_before_update = vsetLogicalSize(getVset(o));
+    for (int i = 0; i < 50; i++) {
+        char f[32], v[128];
+        snprintf(f, sizeof(f), "rax_field_%d", i);
+        snprintf(v, sizeof(v), "updated_rax_value_%d_much_longer_than_before_to_test_size_change", i);
+        hashSetExpiry(o, f, v, future + i * 100);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    ASSERT_EQ(vsetLogicalSize(getVset(o)), vset_before_update)
+        << "updating values should not change vset container size";
+
+    /* Delete all expiry entries — vset should shrink to zero */
+    for (int i = 0; i < 200; i++) {
+        char f[32];
+        snprintf(f, sizeof(f), "rax_field_%d", i);
+        hashDel(o, f);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+
+    /* Delete plain entries */
+    for (int i = 0; i < 50; i++) {
+        char f[32];
+        snprintf(f, sizeof(f), "plain_%d", i);
+        hashDel(o, f);
+    }
+    ASSERT_HASH_LOGICAL_SIZE(o, ht);
+    ASSERT_EQ(hashtableTrackedDataBytes(ht), 0ul);
+
     decrRefCount(o);
 }

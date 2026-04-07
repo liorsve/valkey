@@ -1187,6 +1187,25 @@ char *strEncoding(int encoding) {
 /* =========================== Memory introspection ========================= */
 
 
+/* O(1) logical size for hash objects using tracked counters.
+ * For hashtable encoding: hashtable container + tracked entry sizes + vset container.
+ * For listpack encoding: lpBytes (already O(1)).
+ * This replaces the O(n) sampling in objectComputeSize for hash objects. */
+size_t hashTypeLogicalSize(robj *o) {
+    serverAssert(o->type == OBJ_HASH);
+    if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        return lpBytes(objectGetVal(o));
+    } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+        hashtable *ht = objectGetVal(o);
+        vset *volatile_fields = hashtableMetadata(ht);
+        size_t size = hashtableMemUsage(ht) + hashtableTrackedDataBytes(ht);
+        if (vsetIsValid(volatile_fields)) size += vsetLogicalSize(volatile_fields);
+        return size;
+    }
+    serverPanic("Unknown hash encoding");
+    return 0;
+}
+
 /* Returns the size in bytes consumed by the key's value in RAM.
  * Note that the returned value is just an approximation, especially in the
  * case of aggregated data types where only "sample_size" elements

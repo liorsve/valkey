@@ -2284,6 +2284,83 @@ size_t vsetMemUsage(vset *set) {
     return 0;
 }
 
+/* O(1) logical size for vset. For NONE/SINGLE: 0. For VECTOR: logical
+ * pVector size. For RAX: uses tracked counters (raxLogicalSize + inner
+ * bucket data). This accounts for all vset-owned container memory — the
+ * actual entry data is owned by the hash's hashtable, not by the vset. */
+size_t vsetLogicalSize(vset *set) {
+    int bucket_type = vsetBucketType(*set);
+    switch (bucket_type) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+        return 0;
+    case VSET_BUCKET_VECTOR: {
+        pVector *pv = vsetBucketVector(*set);
+        return sizeof(pVector) + pvLen(pv) * sizeof(void *);
+    }
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        vsetRaxState *state = vsetBucketRaxState(*set);
+        return sizeof(vsetRaxState) + raxLogicalSize(state->r) + state->tracked_data_bytes;
+    }
+    default:
+        panic("Unknown set type encountered in vsetLogicalSize");
+    }
+    return 0;
+}
+
+/* O(n) independent computation of vset logical size. Walks all structures
+ * without relying on any tracked counters. Used for test verification. */
+size_t vsetComputeLogicalSize(vset *set) {
+    int bucket_type = vsetBucketType(*set);
+    switch (bucket_type) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+        return 0;
+    case VSET_BUCKET_VECTOR: {
+        pVector *pv = vsetBucketVector(*set);
+        return sizeof(pVector) + pvLen(pv) * sizeof(void *);
+    }
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        /* Compute entirely from pre-existing APIs — no dependency on new
+         * tracking code so this serves as independent ground truth. */
+        rax *r = vsetBucketRax(*set);
+        size_t total = sizeof(vsetRaxState) + raxComputeLogicalSize(r);
+        raxIterator it;
+        raxStart(&it, r);
+        raxSeek(&it, "^", NULL, 0);
+        while (raxNext(&it)) {
+            vsetBucket *inner = it.data;
+            switch (vsetBucketType(inner)) {
+            case VSET_BUCKET_NONE:
+            case VSET_BUCKET_SINGLE:
+                break;
+            case VSET_BUCKET_VECTOR: {
+                pVector *pv = vsetBucketVector(inner);
+                total += sizeof(pVector) + pvLen(pv) * sizeof(void *);
+                break;
+            }
+            case VSET_BUCKET_HT:
+                total += hashtableMemUsage(vsetBucketHashtable(inner));
+                break;
+            default:
+                break;
+            }
+        }
+        raxStop(&it);
+        return total;
+    }
+    default:
+        panic("Unknown set type encountered in vsetComputeLogicalSize");
+    }
+    return 0;
+}
+
 /* Verify that vsetRaxState.tracked_data_bytes matches a full O(n) walk
  * of all inner buckets. Only meaningful when vset is in RAX encoding.
  * Returns 1 if correct (or not RAX), 0 on mismatch with description
@@ -2298,7 +2375,23 @@ int vsetVerifyTracking(vset *set, char *errmsg, size_t errlen) {
     raxStart(&it, state->r);
     raxSeek(&it, "^", NULL, 0);
     while (raxNext(&it)) {
-        walk += vsetInnerBucketDataSize(it.data);
+        /* Compute independently from vsetInnerBucketDataSize. */
+        vsetBucket *inner = it.data;
+        switch (vsetBucketType(inner)) {
+        case VSET_BUCKET_NONE:
+        case VSET_BUCKET_SINGLE:
+            break;
+        case VSET_BUCKET_VECTOR: {
+            pVector *pv = vsetBucketVector(inner);
+            walk += sizeof(pVector) + pvLen(pv) * sizeof(void *);
+            break;
+        }
+        case VSET_BUCKET_HT:
+            walk += hashtableMemUsage(vsetBucketHashtable(inner));
+            break;
+        default:
+            break;
+        }
     }
     raxStop(&it);
     if (state->tracked_data_bytes != walk) {

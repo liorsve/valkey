@@ -626,8 +626,7 @@ hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictSdsDestructor,
-    .entryGetSize = sdsEntryGetSize
-};
+    .entryGetSize = sdsEntryGetSize};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;
