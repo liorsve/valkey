@@ -615,11 +615,18 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
+/* Return the logical size of an SDS entry: header + content + null terminator. */
+size_t sdsEntryGetSize(const void *entry) {
+    const_sds s = (const_sds)entry;
+    return sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+}
+
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = dictSdsDestructor,
+    .entryGetSize = sdsEntryGetSize};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;
@@ -714,6 +721,10 @@ size_t hashHashtableTypeMetadataSize(void) {
     return sizeof(void *);
 }
 
+size_t hashEntryGetSize(const void *entry) {
+    return entryGetLogicalSize(entry);
+}
+
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
@@ -721,6 +732,7 @@ hashtableType hashHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
@@ -729,6 +741,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
 };
