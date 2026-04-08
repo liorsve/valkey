@@ -39,11 +39,18 @@
 #ifndef LISTPACK_ALLOC_H
 #define LISTPACK_ALLOC_H
 #include "zmalloc.h"
+
+/* File-local variable defined in listpack.c that captures the usable
+ * allocation size from the last lp_malloc / lp_realloc call.  zmalloc_usable
+ * and zrealloc_usable already compute this internally; we just stop
+ * discarding it.  Exposed to callers via lpLastAllocSize(). */
+static size_t lp_last_alloc_size = 0;
+
 /* We use zmalloc_usable/zrealloc_usable instead of zmalloc/zrealloc
  * to ensure the safe invocation of 'zmalloc_usable_size().
  * See comment in zmalloc_usable_size(). */
-#define lp_malloc(sz) zmalloc_usable(sz, NULL)
-#define lp_realloc(ptr, sz) zrealloc_usable(ptr, sz, NULL)
+#define lp_malloc(sz) zmalloc_usable(sz, &lp_last_alloc_size)
+#define lp_realloc(ptr, sz) zrealloc_usable(ptr, sz, &lp_last_alloc_size)
 #define lp_free zfree
 #define lp_malloc_size zmalloc_usable_size
 #endif

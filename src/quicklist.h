@@ -49,6 +49,7 @@ typedef struct quicklistNode {
     struct quicklistNode *next;
     unsigned char *entry;
     size_t sz;                           /* entry size in bytes */
+    size_t entry_alloc_sz;               /* usable allocation size of entry */
     unsigned int count : 16;             /* count of items in listpack */
     unsigned int encoding : 2;           /* RAW==1 or LZF==2 */
     unsigned int container : 2;          /* PLAIN==1 or PACKED==2 */
@@ -109,6 +110,7 @@ typedef struct quicklist {
     quicklistNode *tail;
     unsigned long count;                  /* total count of all entries in all listpacks */
     unsigned long len;                    /* number of quicklistNodes */
+    size_t tracked_size;                  /* total memory allocated for this quicklist */
     signed int fill : QL_FILL_BITS;       /* fill factor for individual nodes */
     unsigned int compress : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
     unsigned int bookmark_count : QL_BM_BITS;
