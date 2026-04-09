@@ -511,6 +511,57 @@ size_t entryMemUsage(entry *entry) {
     return mem;
 }
 
+/* Returns the logical size of an entry using only struct fields — no zmalloc
+ * calls. sdsReqSize returns sdsHdrSize + sdslen + 1 (header + content + null
+ * terminator) for the full logical footprint of an SDS string.
+ *
+ * Type 1 (SDS_TYPE_5 field, embedded value, no expiry):
+ *   [ sdshdr5 | field \0 | sdshdr8 | value \0 (padding) ]
+ *   = sdsReqSize(field) + sdsReqSize(value)
+ *
+ * Type 2 (SDS_TYPE_8 field, embedded value, optional expiry):
+ *   [ mstime_t? | sdshdr8 | field \0 | sdshdr8 | value \0 (padding) ]
+ *   = sizeof(mstime_t)? + sdsReqSize(field) + sdsReqSize(value)
+ *
+ * Type 3 (field + separate sds value pointer, optional expiry):
+ *   Entry alloc:    [ mstime_t? | sds* | sdshdr8 | field \0 ]
+ *   Separate alloc: [ sdshdr | value \0 ]
+ *   = sizeof(mstime_t)? + sizeof(void*) + sdsReqSize(field) + sdsReqSize(value)
+ *
+ * Type 4 (field + stringRef pointer, optional expiry):
+ *   Entry alloc:    [ mstime_t? | stringRef* | sdshdr8 | field \0 ]
+ *   Separate alloc: [ const char *buf | size_t len ]
+ *   = sizeof(mstime_t)? + sizeof(void*) + sdsReqSize(field) + sizeof(stringRef)
+ *   (the buffer pointed to by stringRef is NOT owned, so not counted)
+ */
+size_t entryGetLogicalSize(const entry *e) {
+    sds field = entryGetField(e);
+    /* Field: always embedded in the entry allocation. */
+    size_t size = sdsReqSize(sdslen(field), sdsType(field));
+
+    /* Expiry: optional mstime_t prepended before the field (Types 2/3/4). */
+    if (entryHasExpiry(e)) size += sizeof(mstime_t);
+
+    if (entryHasEmbeddedValue(e)) {
+        /* Types 1 & 2: value SDS is embedded right after the field. */
+        size_t vlen;
+        sds val = (sds)entryGetValue(e, &vlen);
+        size += sdsReqSize(vlen, sdsType(val));
+    } else {
+        /* Types 3 & 4: a pointer to the value is stored before the field. */
+        size += sizeof(void *);
+        if (entryHasStringRef(e)) {
+            /* Type 4: value is a stringRef struct (buf pointer + length). */
+            size += sizeof(stringRef);
+        } else {
+            /* Type 3: value is a separately allocated SDS. */
+            sds val = *(sds *)entryGetSdsValueRef(e);
+            size += sdsReqSize(sdslen(val), sdsType(val));
+        }
+    }
+    return size;
+}
+
 /* Defragments a entry (field-value pair) if needed, using the
  * provided defrag functions. The defrag functions return NULL if the allocation
  * was not moved, otherwise they return a pointer to the new memory location.
