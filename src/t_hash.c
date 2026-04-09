@@ -340,9 +340,11 @@ int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len) {
     void **entry_ref = hashtableFindRef(ht, field);
     entry *entry = *entry_ref;
     mstime_t expiry = entryGetExpiry(entry);
+    size_t old_size = entryGetLogicalSize(entry);
     void *new_entry = entryUpdateAsStringRef(entry, buf, len, expiry);
     bool replaced = hashtableReplaceReallocatedEntry(ht, entry, new_entry);
     serverAssert(replaced);
+    hashtableAdjustTrackedDataBytes(ht, (ssize_t)entryGetLogicalSize(new_entry) - (ssize_t)old_size);
     hashTypeTrackUpdateEntry(o, entry, new_entry, expiry, expiry);
     return C_OK;
 }
@@ -437,12 +439,14 @@ int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool 
                 /* In case the HASH_SET_KEEP_EXPIRY will force keeping the existing entry expiry. */
                 expiry = entry_expiry;
             }
+            size_t old_size = entryGetLogicalSize(existing);
             void *new_entry = entryUpdate(existing, v, expiry);
             if (new_entry != existing) {
                 /* It has been reallocated. */
                 bool replaced = hashtableReplaceReallocatedEntry(ht, existing, new_entry);
                 serverAssert(replaced);
             }
+            hashtableAdjustTrackedDataBytes(ht, (ssize_t)entryGetLogicalSize(new_entry) - (ssize_t)old_size);
 
             hashTypeTrackUpdateEntry(o, existing, new_entry, entry_expiry, expiry);
 
@@ -543,7 +547,9 @@ static expiryModificationResult hashTypeSetExpire(robj *o, sds field, mstime_t e
             serverAssert(hashTypeDelete(o, field));
             return EXPIRATION_MODIFICATION_EXPIRE_ASAP;
         }
+        size_t old_size = entryGetLogicalSize(current_entry);
         *entry_ref = entrySetExpiry(current_entry, expiry);
+        hashtableAdjustTrackedDataBytes(ht, (ssize_t)entryGetLogicalSize(*entry_ref) - (ssize_t)old_size);
         hashTypeTrackUpdateEntry(o, current_entry, *entry_ref, current_expire, expiry);
         return EXPIRATION_MODIFICATION_SUCCESSFUL;
     }
@@ -570,7 +576,9 @@ static expiryModificationResult hashTypePersist(robj *o, sds field) {
         mstime_t current_expire = entryGetExpiry(current_entry);
         if (current_expire != EXPIRY_NONE) {
             hashTypeUntrackEntry(o, current_entry);
+            size_t old_size = entryGetLogicalSize(current_entry);
             *entry_ref = entrySetExpiry(current_entry, EXPIRY_NONE);
+            hashtableAdjustTrackedDataBytes(ht, (ssize_t)entryGetLogicalSize(*entry_ref) - (ssize_t)old_size);
             return EXPIRATION_MODIFICATION_SUCCESSFUL;
         }
         return EXPIRATION_MODIFICATION_FAILED; // If the found element has no expiration set, return -1

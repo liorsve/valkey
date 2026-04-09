@@ -479,3 +479,220 @@ TEST_F(VsetTest, TestVsetFuzzer) {
     ASSERT_TRUE(vsetIsEmpty(&set) && mock_entry_count == 0);
     vsetRelease(&set);
 }
+
+/* ── Tracking tests ─────────────────────────────────────────────────── */
+
+#define ASSERT_VSET_TRACKING(set)                                    \
+    do {                                                             \
+        char errmsg[256];                                            \
+        ASSERT_TRUE(vsetVerifyTracking(set, errmsg, sizeof(errmsg))) \
+            << errmsg;                                               \
+    } while (0)
+
+/* Force promotion to RAX by inserting enough entries */
+static void fillToRax(vset *set, int count, long long base_expiry) {
+    for (int i = 0; i < count; i++) {
+        insert_mock_entry_with_expiry(set, base_expiry + i * 100);
+    }
+}
+
+TEST_F(VsetTest, TrackingAddToRax) {
+    vset set;
+    vsetInit(&set);
+
+    /* Fill past VECTOR max (127) to trigger RAX promotion */
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Add more entries */
+    for (int i = 0; i < 100; i++) {
+        insert_mock_entry_with_expiry(&set, 50000 + i * 100);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetClear(&set);
+}
+
+TEST_F(VsetTest, TrackingRemoveFromRax) {
+    vset set;
+    vsetInit(&set);
+
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Remove entries one by one */
+    while (mock_entry_count > 0) {
+        remove_mock_entry(&set);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetRelease(&set);
+}
+
+TEST_F(VsetTest, TrackingExpireFromRax) {
+    vset set;
+    vsetInit(&set);
+
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Expire in batches */
+    for (long long now = 2000; now < 30000; now += 2000) {
+        expire_mock_entries(&set, now);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    /* Expire everything */
+    expire_mock_entries(&set, LLONG_MAX);
+    vsetRelease(&set);
+}
+
+TEST_F(VsetTest, TrackingUpdateInRax) {
+    vset set;
+    vsetInit(&set);
+
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Update random entries */
+    for (int i = 0; i < 200; i++) {
+        update_mock_entry(&set);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetClear(&set);
+}
+
+/* Same-bucket-ts promotion: all entries fall in one 8192ms time window,
+ * so the vector is moved as-is to the rax (not migrated entry-by-entry).
+ * Tests the existing_data initialization path in vsetAddEntry. */
+TEST_F(VsetTest, TrackingSameBucketPromotion) {
+    vset set;
+    vsetInit(&set);
+
+    /* All entries within [1000, 1000+127) — same get_max_bucket_ts window (8192ms). */
+    for (int i = 0; i < 128; i++) {
+        insert_mock_entry_with_expiry(&set, 1000 + i);
+    }
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Add more in same window */
+    for (int i = 0; i < 50; i++) {
+        insert_mock_entry_with_expiry(&set, 2000 + i);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetClear(&set);
+}
+
+/* Force VECTOR→HT conversion inside RAX: fill a single time bucket
+ * past the vector max (127) so it can't be split (all same bucket_ts). */
+TEST_F(VsetTest, TrackingVectorToHashtable) {
+    vset set;
+    vsetInit(&set);
+
+    /* First promote to RAX with entries in two different time windows */
+    for (int i = 0; i < 128; i++) {
+        insert_mock_entry_with_expiry(&set, 1000 + i);
+    }
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Now add 128 more entries all in the SAME fine-grained bucket (same
+     * get_bucket_ts, 16ms window). This forces the vector to exceed max
+     * size and convert to HT since it can't be split. */
+    for (int i = 0; i < 128; i++) {
+        insert_mock_entry_with_expiry(&set, 1000);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetClear(&set);
+}
+
+/* Defrag while in RAX mode — the vsetRaxState wrapper and rax are
+ * reallocated. tracked_data_bytes must survive. */
+TEST_F(VsetTest, TrackingDefrag) {
+    vset set;
+    vsetInit(&set);
+
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Defrag everything */
+    ASSERT_EQ(defrag_vset(&set, 0, 0), 0u);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Add more after defrag to verify tracking still works */
+    for (int i = 0; i < 50; i++) {
+        insert_mock_entry_with_expiry(&set, 50000 + i * 100);
+    }
+    ASSERT_VSET_TRACKING(&set);
+
+    vsetClear(&set);
+}
+
+/* RAX shrinks back to VECTOR/SINGLE when only one inner bucket remains.
+ * Verify tracking is correct just before the shrink. */
+TEST_F(VsetTest, TrackingShrinkFromRax) {
+    vset set;
+    vsetInit(&set);
+
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    /* Remove most entries — check tracking while still in RAX */
+    while (mock_entry_count > 5) {
+        remove_mock_entry(&set);
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    /* Remove remaining — may trigger shrink to VECTOR/SINGLE */
+    while (mock_entry_count > 0) {
+        remove_mock_entry(&set);
+        /* After shrink, vsetVerifyTracking returns 1 (not RAX, nothing to verify) */
+        ASSERT_VSET_TRACKING(&set);
+    }
+
+    vsetRelease(&set);
+}
+
+TEST_F(VsetTest, TrackingFuzzer) {
+    unsigned seed = static_cast<unsigned>(time(nullptr)) ^ static_cast<unsigned>(getpid());
+    srand(seed);
+    printf("  Vset tracking fuzzer seed: %u\n", seed);
+
+    vset set;
+    vsetInit(&set);
+
+    /* First fill to RAX */
+    fillToRax(&set, 200, 1000);
+    ASSERT_VSET_TRACKING(&set);
+
+    for (int i = 0; i < 10000; i++) {
+        int op = rand() % 5;
+        switch (op) {
+        case 0:
+        case 1:
+            insert_mock_entry(&set);
+            break;
+        case 2:
+            update_mock_entry(&set);
+            break;
+        case 3:
+            remove_mock_entry(&set);
+            break;
+        case 4: {
+            mstime_t now = rand() % 10000;
+            expire_mock_entries(&set, now);
+            break;
+        }
+        }
+
+        if (i % 50 == 0) {
+            ASSERT_VSET_TRACKING(&set);
+        }
+    }
+    ASSERT_VSET_TRACKING(&set);
+
+    expire_mock_entries(&set, LLONG_MAX);
+    vsetRelease(&set);
+}
