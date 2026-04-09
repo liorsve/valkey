@@ -34,6 +34,7 @@
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
+#include "cluster_slot_stats.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -557,6 +558,17 @@ int performEvictions(void) {
              *
              * AOF and Output buffer memory will be freed eventually so
              * we only care about memory used by the key space. */
+            /* Subtract this key's memory from slot stats before deletion. */
+            if (clusterSlotStatsEnabled(bestslot)) {
+                robj *val = dbFind(db, bestkey);
+                if (val) {
+                    size_t d, o;
+                    objectLogicalSize(val, &d, &o);
+                    server.cluster->slot_stats[bestslot].data_bytes -= (int64_t)d;
+                    server.cluster->slot_stats[bestslot].overhead_bytes -= (int64_t)o;
+                }
+            }
+
             enterExecutionUnit(1, 0);
             delta = (long long)zmalloc_used_memory();
             latencyStartMonitor(eviction_latency);

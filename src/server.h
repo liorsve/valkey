@@ -1402,6 +1402,8 @@ typedef struct client {
     unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
     unsigned long long commands_processed;        /* Total count of commands this client executed. */
     unsigned long long net_output_bytes_curr_cmd; /* Total network output bytes sent to this client, by the current command. */
+    size_t slot_mem_data_before;                  /* Slot memory: data bytes before current command. */
+    size_t slot_mem_overhead_before;              /* Slot memory: overhead bytes before current command. */
     size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
     int nwritten;                                 /* Number of bytes of the last write. */
     int nread;                                    /* Number of bytes of the last read. */
@@ -3583,6 +3585,7 @@ int hashTypeExists(robj *o, sds key);
 bool hashTypeDelete(robj *o, sds key);
 unsigned long hashTypeLength(const robj *o);
 size_t hashTypeLogicalSize(robj *o);
+void objectLogicalSize(robj *o, size_t *data_bytes, size_t *overhead_bytes);
 void hashTypeInitIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeInitVolatileIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeResetIterator(hashTypeIterator *hi);

@@ -3907,6 +3907,13 @@ void call(client *c, int flags) {
     long long old_primary_repl_offset = server.primary_repl_offset;
     incrCommandStatsOnError(NULL, 0);
 
+    /* Snapshot per-slot memory before the command for write commands. */
+    int track_slot_memory = clusterSlotStatsEnabled(c->slot) && (c->cmd->flags & CMD_WRITE);
+    slotMemKeys slot_mem_keys;
+    if (track_slot_memory) {
+        clusterSlotStatsSnapshotMemoryBefore(c, &slot_mem_keys);
+    }
+
     const ustime_t call_timer = ustime();
     enterExecutionUnit(1, call_timer);
 
@@ -3925,6 +3932,17 @@ void call(client *c, int flags) {
     c->cmd->proc(c);
 
     exitExecutionUnit();
+
+    /* Apply per-slot memory deltas after the command. */
+    if (track_slot_memory) {
+        if (!c->flag.blocked) {
+            clusterSlotStatsApplyMemoryAfter(c, &slot_mem_keys);
+        } else {
+            /* Command blocked — free the saved key names without applying deltas.
+             * The delta will be captured when the command is reprocessed after unblocking. */
+            clusterSlotStatsFreeKeys(&slot_mem_keys);
+        }
+    }
 
     /* In case client is blocked after trying to execute the command,
      * it means the execution is not yet completed and we MIGHT reprocess the command in the future. */

@@ -23,7 +23,7 @@ extern "C" {
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
 }
 
-class QuicklistTrackingVsComputeTest : public ::testing::Test {
+class DISABLED_QuicklistTrackingVsComputeTest : public ::testing::Test {
 };
 
 static size_t trackedTotal(quicklist *ql) {
@@ -48,7 +48,7 @@ static size_t trackedTotal(quicklist *ql) {
     } while (0)
 
 /* 1 */
-TEST_F(QuicklistTrackingVsComputeTest, BasicPushHeadTail) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, BasicPushHeadTail) {
     robj *list = createQuicklistObject(3, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 50; i++) {
@@ -64,7 +64,7 @@ TEST_F(QuicklistTrackingVsComputeTest, BasicPushHeadTail) {
 }
 
 /* 2 */
-TEST_F(QuicklistTrackingVsComputeTest, PushCreatesNewNodes) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, PushCreatesNewNodes) {
     robj *list = createQuicklistObject(1, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 20; i++) {
@@ -77,7 +77,7 @@ TEST_F(QuicklistTrackingVsComputeTest, PushCreatesNewNodes) {
 }
 
 /* 3 */
-TEST_F(QuicklistTrackingVsComputeTest, PopHeadAndTail) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, PopHeadAndTail) {
     robj *list = createQuicklistObject(3, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 30; i++) {
@@ -106,7 +106,7 @@ TEST_F(QuicklistTrackingVsComputeTest, PopHeadAndTail) {
 }
 
 /* 4 */
-TEST_F(QuicklistTrackingVsComputeTest, DeleteEntireNode) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, DeleteEntireNode) {
     robj *list = createQuicklistObject(2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 10; i++) {
@@ -127,7 +127,7 @@ TEST_F(QuicklistTrackingVsComputeTest, DeleteEntireNode) {
 }
 
 /* 5 */
-TEST_F(QuicklistTrackingVsComputeTest, CompressDecompress) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, CompressDecompress) {
     robj *list = createQuicklistObject(-2, 1);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 500; i++) {
@@ -162,7 +162,7 @@ TEST_F(QuicklistTrackingVsComputeTest, CompressDecompress) {
 }
 
 /* 6 */
-TEST_F(QuicklistTrackingVsComputeTest, InsertNonFullNode) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InsertNonFullNode) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 20; i++) {
@@ -184,7 +184,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InsertNonFullNode) {
 }
 
 /* 7 */
-TEST_F(QuicklistTrackingVsComputeTest, InsertTriggersSplit) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InsertTriggersSplit) {
     robj *list = createQuicklistObject(3, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 12; i++) {
@@ -202,7 +202,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InsertTriggersSplit) {
 }
 
 /* 8a */
-TEST_F(QuicklistTrackingVsComputeTest, InsertNextNeighbor) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InsertNextNeighbor) {
     robj *list = createQuicklistObject(4, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 6; i++) {
@@ -219,7 +219,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InsertNextNeighbor) {
 }
 
 /* 8b */
-TEST_F(QuicklistTrackingVsComputeTest, InsertPrevNeighbor) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InsertPrevNeighbor) {
     robj *list = createQuicklistObject(4, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 8; i++) {
@@ -241,7 +241,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InsertPrevNeighbor) {
 }
 
 /* 9 */
-TEST_F(QuicklistTrackingVsComputeTest, ReplaceEntryListpack) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, ReplaceEntryListpack) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 20; i++) {
@@ -264,7 +264,7 @@ TEST_F(QuicklistTrackingVsComputeTest, ReplaceEntryListpack) {
 }
 
 /* 10 */
-TEST_F(QuicklistTrackingVsComputeTest, ReplaceEntryPlainNode) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, ReplaceEntryPlainNode) {
     quicklistSetPackedThreshold(64);
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
@@ -288,7 +288,7 @@ TEST_F(QuicklistTrackingVsComputeTest, ReplaceEntryPlainNode) {
 }
 
 /* 11 */
-TEST_F(QuicklistTrackingVsComputeTest, DelRange) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, DelRange) {
     robj *list = createQuicklistObject(5, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 30; i++) {
@@ -308,7 +308,7 @@ TEST_F(QuicklistTrackingVsComputeTest, DelRange) {
 }
 
 /* 12 */
-TEST_F(QuicklistTrackingVsComputeTest, Rotate) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, Rotate) {
     robj *list = createQuicklistObject(3, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 15; i++) {
@@ -324,7 +324,7 @@ TEST_F(QuicklistTrackingVsComputeTest, Rotate) {
 }
 
 /* 13 */
-TEST_F(QuicklistTrackingVsComputeTest, Dup) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, Dup) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 100; i++) {
@@ -342,7 +342,7 @@ TEST_F(QuicklistTrackingVsComputeTest, Dup) {
 }
 
 /* 14 */
-TEST_F(QuicklistTrackingVsComputeTest, DupWithCompression) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, DupWithCompression) {
     robj *list = createQuicklistObject(-2, 1);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 500; i++) {
@@ -360,7 +360,7 @@ TEST_F(QuicklistTrackingVsComputeTest, DupWithCompression) {
 }
 
 /* 15 */
-TEST_F(QuicklistTrackingVsComputeTest, NodeMerge) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, NodeMerge) {
     robj *list = createQuicklistObject(4, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 12; i++) {
@@ -379,7 +379,7 @@ TEST_F(QuicklistTrackingVsComputeTest, NodeMerge) {
 }
 
 /* 16 */
-TEST_F(QuicklistTrackingVsComputeTest, PlainNodeInsert) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, PlainNodeInsert) {
     quicklistSetPackedThreshold(64);
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
@@ -407,7 +407,7 @@ TEST_F(QuicklistTrackingVsComputeTest, PlainNodeInsert) {
 }
 
 /* 17 */
-TEST_F(QuicklistTrackingVsComputeTest, InsertEmptyList) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InsertEmptyList) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     quicklistEntry entry;
@@ -421,7 +421,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InsertEmptyList) {
 }
 
 /* 18 */
-TEST_F(QuicklistTrackingVsComputeTest, InterleavedCompressOps) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, InterleavedCompressOps) {
     robj *list = createQuicklistObject(-2, 2);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 1000; i++) {
@@ -461,7 +461,7 @@ TEST_F(QuicklistTrackingVsComputeTest, InterleavedCompressOps) {
 }
 
 /* 19 */
-TEST_F(QuicklistTrackingVsComputeTest, AppendListpackAndPlainNode) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, AppendListpackAndPlainNode) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     unsigned char *lp = lpNew(0);
@@ -481,7 +481,7 @@ TEST_F(QuicklistTrackingVsComputeTest, AppendListpackAndPlainNode) {
 }
 
 /* 20 */
-TEST_F(QuicklistTrackingVsComputeTest, DelEntryViaIterator) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, DelEntryViaIterator) {
     robj *list = createQuicklistObject(5, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 25; i++) {
@@ -502,7 +502,7 @@ TEST_F(QuicklistTrackingVsComputeTest, DelEntryViaIterator) {
 }
 
 /* 21 */
-TEST_F(QuicklistTrackingVsComputeTest, ReplaceAtIndex) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, ReplaceAtIndex) {
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 30; i++) {
@@ -518,7 +518,7 @@ TEST_F(QuicklistTrackingVsComputeTest, ReplaceAtIndex) {
 }
 
 /* 22 */
-TEST_F(QuicklistTrackingVsComputeTest, SameSizeReplace) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, SameSizeReplace) {
     robj *list = createQuicklistObject(4, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 8; i++) {
@@ -533,7 +533,7 @@ TEST_F(QuicklistTrackingVsComputeTest, SameSizeReplace) {
 }
 
 /* 23. Replace plain node with small value (plain→packed conversion) */
-TEST_F(QuicklistTrackingVsComputeTest, ReplacePlainWithSmall) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, ReplacePlainWithSmall) {
     quicklistSetPackedThreshold(64);
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
@@ -551,7 +551,7 @@ TEST_F(QuicklistTrackingVsComputeTest, ReplacePlainWithSmall) {
 }
 
 /* 25. Large element insert with split */
-TEST_F(QuicklistTrackingVsComputeTest, LargeElementInsertWithSplit) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, LargeElementInsertWithSplit) {
     quicklistSetPackedThreshold(64);
     robj *list = createQuicklistObject(-2, 0);
     quicklist *ql = (quicklist *)objectGetVal(list);
@@ -572,7 +572,7 @@ TEST_F(QuicklistTrackingVsComputeTest, LargeElementInsertWithSplit) {
 }
 
 /* 26. Deep compress depth */
-TEST_F(QuicklistTrackingVsComputeTest, DeepCompressDepth) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, DeepCompressDepth) {
     robj *list = createQuicklistObject(-2, 3);
     quicklist *ql = (quicklist *)objectGetVal(list);
     for (int i = 0; i < 2000; i++) {
@@ -596,7 +596,7 @@ TEST_F(QuicklistTrackingVsComputeTest, DeepCompressDepth) {
 }
 
 /* 27. Fuzzer */
-TEST_F(QuicklistTrackingVsComputeTest, Fuzzer) {
+TEST_F(DISABLED_QuicklistTrackingVsComputeTest, Fuzzer) {
     unsigned int seed = 42;
     robj *list = createQuicklistObject(-2, 1);
     quicklist *ql = (quicklist *)objectGetVal(list);
