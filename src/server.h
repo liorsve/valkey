@@ -943,6 +943,7 @@ typedef struct serverDb {
     dict *ready_keys;                     /* Blocked keys that received a PUSH */
     dict *watched_keys;                   /* WATCHED keys for MULTI/EXEC CAS */
     int id;                               /* Database ID */
+    hashtable *key_mem_cache;             /* Per-key cached logical sizes for slot memory tracking */
     struct {
         long long avg_ttl;    /* Average TTL, just for stats */
         unsigned long cursor; /* Cursor of the active expire cycle. */
@@ -3583,6 +3584,7 @@ int hashTypeExists(robj *o, sds key);
 bool hashTypeDelete(robj *o, sds key);
 unsigned long hashTypeLength(const robj *o);
 size_t hashTypeLogicalSize(robj *o);
+void objectLogicalSize(robj *o, size_t *data_bytes, size_t *overhead_bytes);
 void hashTypeInitIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeInitVolatileIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeResetIterator(hashTypeIterator *hi);
@@ -3914,6 +3916,7 @@ uint64_t dictSdsCaseHash(const void *key);
 uint64_t dictCStrHash(const void *key);
 uint64_t dictCStrCaseHash(const void *key);
 uint64_t dictEncObjHash(const void *key);
+uint64_t sdsHashConfigurableSeed(const void *key);
 int dictSdsKeyCompare(const void *key1, const void *key2);
 int dictSdsKeyCaseCompare(const void *key1, const void *key2);
 int dictCStrKeyCompare(const void *key1, const void *key2);

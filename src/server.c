@@ -2903,6 +2903,9 @@ serverDb *createDatabase(int id) {
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
+    db->key_mem_cache = (server.cluster_slot_stats_enabled)
+                            ? hashtableCreate(&keySizeCacheHashtableType)
+                            : NULL;
     if (clusterIsAnySlotImporting()) {
         clusterMarkImportingSlotsInDb(db);
     }

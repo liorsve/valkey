@@ -1050,3 +1050,529 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-en
         R 0 config set min-string-size-avoid-copy-reply $copy_avoid
     }
 }
+
+# -----------------------------------------------------------------------------
+# Test cases for CLUSTER SLOT-STATS memory-data-bytes / memory-overhead-bytes.
+# Uses DEBUG SLOT-VERIFY-MEMORY to independently walk all keys in a slot and
+# verify that slot_stats match. The walk does NOT use objectLogicalSize or any
+# tracking field — only pre-existing APIs.
+# -----------------------------------------------------------------------------
+
+# Helper: get memory-data-bytes and memory-overhead-bytes for a given slot.
+proc get_slot_memory {slot} {
+    set slot_stats [R 0 CLUSTER SLOT-STATS SLOTSRANGE $slot $slot]
+    set slot_stats [convert_array_into_dict $slot_stats]
+    set stats [dict get $slot_stats $slot]
+    set data [dict get $stats memory-data-bytes]
+    set overhead [dict get $stats memory-overhead-bytes]
+    return [list $data $overhead]
+}
+
+# Helper: assert slot memory matches independent walk via DEBUG command.
+proc verify_slot_memory {slot} {
+    set result [R 0 DEBUG SLOT-VERIFY-MEMORY $slot]
+    if {$result ne "OK"} {
+        fail "SLOT-VERIFY-MEMORY slot $slot: $result"
+    }
+}
+
+start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-slot-stats-enabled yes enable-debug-command yes}} {
+
+    set key "FOO"
+    set key_slot [R 0 cluster keyslot $key]
+    set key2 "BAR"
+    set key2_slot [R 0 cluster keyslot $key2]
+
+    test "SLOT-STATS memory, initially zero." {
+        lassign [get_slot_memory $key_slot] data overhead
+        assert_equal $data 0
+        assert_equal $overhead 0
+    }
+
+    test "SLOT-STATS memory, string SET and verify." {
+        R 0 SET $key "hello world"
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data overhead
+        assert {$data > 0}
+        assert_equal $overhead 0
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, string overwrite changes size." {
+        R 0 SET $key "small"
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_small _
+
+        R 0 SET $key [string repeat "x" 1000]
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_large _
+        assert {$data_large > $data_small}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, integer string has zero data." {
+        R 0 SET $key 42
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data overhead
+        assert_equal $data 0
+        assert_equal $overhead 0
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, DEL removes all memory." {
+        R 0 SET $key [string repeat "x" 500]
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before _
+        assert {$data_before > 0}
+
+        R 0 DEL $key
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_after _
+        assert_equal $data_after 0
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, two keys in same slot." {
+        set tag_key1 "{$key}:a"
+        set tag_key2 "{$key}:b"
+        R 0 SET $tag_key1 "aaa"
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data1 _
+
+        R 0 SET $tag_key2 "bbbbb"
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data2 _
+        assert {$data2 > $data1}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, different slots are independent." {
+        R 0 SET $key "aaaa"
+        R 0 SET $key2 [string repeat "b" 100]
+        verify_slot_memory $key_slot
+        verify_slot_memory $key2_slot
+
+        R 0 DEL $key
+        verify_slot_memory $key_slot
+        verify_slot_memory $key2_slot
+        lassign [get_slot_memory $key_slot] data1 _
+        lassign [get_slot_memory $key2_slot] data2 _
+        assert_equal $data1 0
+        assert {$data2 > 0}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, FLUSHALL resets to zero." {
+        R 0 SET $key "value1"
+        R 0 SET $key2 "value2"
+        R 0 FLUSHALL
+        lassign [get_slot_memory $key_slot] data1 _
+        lassign [get_slot_memory $key2_slot] data2 _
+        assert_equal $data1 0
+        assert_equal $data2 0
+    }
+
+    test "SLOT-STATS memory, FLUSHDB SYNC resets and re-tracks correctly." {
+        # Create keys, flush synchronously, then create new keys.
+        # This tests that the per-key cache is cleared on sync flush —
+        # otherwise stale cache entries cause wrong deltas for new keys.
+        R 0 SET $key [string repeat "a" 200]
+        verify_slot_memory $key_slot
+
+        R 0 FLUSHDB SYNC
+
+        lassign [get_slot_memory $key_slot] data_after_flush _
+        assert_equal $data_after_flush 0
+
+        # New key after sync flush must be tracked correctly.
+        R 0 SET $key [string repeat "b" 300]
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_new _
+        assert {$data_new > 0}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, hash in-place growth." {
+        # Force hashtable encoding with enough fields.
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        for {set i 0} {$i < 50} {incr i} {
+            R 0 HSET $key "field_$i" "value_$i"
+            verify_slot_memory $key_slot
+        }
+        lassign [get_slot_memory $key_slot] data overhead
+        assert {$data > 0}
+        assert {$overhead > 0} ;# hashtable encoding has bucket overhead
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, set add and remove." {
+        for {set i 0} {$i < 200} {incr i} {
+            R 0 SADD $key "member_$i"
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_full _
+
+        for {set i 0} {$i < 100} {incr i} {
+            R 0 SREM $key "member_$i"
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_half _
+        assert {$data_half < $data_full}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, list push and pop." {
+        for {set i 0} {$i < 100} {incr i} {
+            R 0 RPUSH $key "item_$i"
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_full overhead_full
+
+        for {set i 0} {$i < 50} {incr i} {
+            R 0 LPOP $key
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_half _
+        assert {$data_half < $data_full}
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, stream append and trim." {
+        # Use small node size so entries span multiple rax nodes.
+        # XTRIM only frees entire rax nodes — tombstoned entries within
+        # a listpack don't reduce lpBytes.
+        R 0 CONFIG SET stream-node-max-entries 5
+        for {set i 0} {$i < 50} {incr i} {
+            R 0 XADD $key "*" field_$i value_$i
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before _
+        assert {$data_before > 0}
+
+        R 0 XTRIM $key MAXLEN 5
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_after _
+        assert {$data_after < $data_before}
+        R 0 CONFIG SET stream-node-max-entries 100
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, mixed types in same slot." {
+        set str_key "{$key}:str"
+        set hash_key "{$key}:hash"
+        set set_key "{$key}:set"
+
+        R 0 SET $str_key "hello"
+        verify_slot_memory $key_slot
+
+        for {set i 0} {$i < 200} {incr i} {
+            R 0 HSET $hash_key "f_$i" "v_$i"
+        }
+        verify_slot_memory $key_slot
+
+        for {set i 0} {$i < 200} {incr i} {
+            R 0 SADD $set_key "m_$i"
+        }
+        verify_slot_memory $key_slot
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, DEBUG SLOT-VERIFY-MEMORY detects mismatch." {
+        # Create a key so slot has non-zero memory.
+        R 0 SET $key "some data here"
+        verify_slot_memory $key_slot
+
+        # CONFIG RESETSTAT zeros slot_stats but leaves keys in place,
+        # creating an intentional mismatch.
+        R 0 CONFIG RESETSTAT
+
+        # Verification must now FAIL because stats say 0 but key exists.
+        catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err
+        assert_match "*mismatch*" $err
+
+        # Restore correct state: FLUSHALL resets counters and removes keys.
+        R 0 FLUSHALL
+    }
+
+    test "SLOT-STATS memory, MULTI/EXEC tracks all sub-commands." {
+        # Force hashtable encoding so we get overhead from bucket arrays.
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        R 0 CONFIG SET set-max-listpack-entries 0
+
+        set r [valkey_client]
+        $r MULTI
+        $r SET $key [string repeat "a" 100]
+        for {set i 0} {$i < 50} {incr i} {
+            $r HSET "{$key}:hash" "field_$i" "value_$i"
+        }
+        for {set i 0} {$i < 50} {incr i} {
+            $r SADD "{$key}:set" "member_$i"
+        }
+        for {set i 0} {$i < 50} {incr i} {
+            $r RPUSH "{$key}:list" "item_$i"
+        }
+        $r EXEC
+
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data overhead
+        assert {$data > 0}
+        assert {$overhead > 0}
+
+        R 0 CONFIG SET hash-max-listpack-entries 128
+        R 0 CONFIG SET set-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, write to expired key (lazy expiry, no double-count)." {
+        # Disable active expiry so the key is NOT cleaned up in the background.
+        # This forces the next write command to trigger lazy expiry inline.
+        R 0 DEBUG SET-ACTIVE-EXPIRE 0
+
+        R 0 SET $key [string repeat "a" 200] PX 100
+        verify_slot_memory $key_slot
+        after 200
+
+        # Key is expired but still in DB (active expiry disabled).
+        # This SET triggers lazy expiry DURING the command.
+        R 0 SET $key [string repeat "b" 300]
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data _
+        assert {$data > 0}
+
+        R 0 DEBUG SET-ACTIVE-EXPIRE 1
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, ORDERBY memory-data-bytes." {
+        R 0 SET $key "small"
+        R 0 SET $key2 [string repeat "x" 500]
+        set slot_stats [R 0 CLUSTER SLOT-STATS ORDERBY memory-data-bytes LIMIT 2 DESC]
+        assert_slot_stats_monotonic_descent $slot_stats memory-data-bytes
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, key expiry removes memory." {
+        # Set a key with 1 second TTL.
+        R 0 SET $key [string repeat "x" 200] PX 500
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before _
+        assert {$data_before > 0}
+
+        # Wait for the key to expire.
+        after 1000
+        # Access the slot to trigger lazy expiry or wait for active expiry.
+        R 0 GET $key
+
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_after _
+        assert_equal $data_after 0
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, fuzzer: random operations across types and slots." {
+        R 0 CONFIG SET hash-max-listpack-entries 0
+
+        set slots [list $key_slot $key2_slot]
+        set prefixes [list "{$key}" "{$key2}"]
+        set types {string hash set list}
+        set counter 0
+
+        for {set iter 0} {$iter < 200} {incr iter} {
+            # Pick a random slot and type.
+            set sidx [expr {int(rand() * 2)}]
+            set prefix [lindex $prefixes $sidx]
+            set slot [lindex $slots $sidx]
+            set type [lindex $types [expr {int(rand() * [llength $types])}]]
+            set k "$prefix:fuzz_${type}"
+
+            # Pick a random operation.
+            set op [expr {int(rand() * 5)}]
+
+            switch $type {
+                string {
+                    switch $op {
+                        0 - 1 { R 0 SET $k [string repeat "v" [expr {int(rand() * 500) + 1}]] }
+                        2     { R 0 APPEND $k "extra" }
+                        3     { R 0 SET $k [incr counter] }
+                        4     { catch { R 0 DEL $k } }
+                    }
+                }
+                hash {
+                    set f "f_[expr {int(rand() * 50)}]"
+                    switch $op {
+                        0 - 1 { R 0 HSET $k $f [string repeat "h" [expr {int(rand() * 100) + 1}]] }
+                        2     { catch { R 0 HDEL $k $f } }
+                        3     { R 0 HSET $k "new_$iter" "val_$iter" }
+                        4     { catch { R 0 DEL $k } }
+                    }
+                }
+                set {
+                    switch $op {
+                        0 - 1 { R 0 SADD $k "m_[expr {int(rand() * 200)}]" }
+                        2     { catch { R 0 SREM $k "m_[expr {int(rand() * 200)}]" } }
+                        3     { catch { R 0 SPOP $k } }
+                        4     { catch { R 0 DEL $k } }
+                    }
+                }
+                list {
+                    switch $op {
+                        0 - 1 { R 0 RPUSH $k "item_[expr {int(rand() * 100)}]" }
+                        2     { catch { R 0 LPOP $k } }
+                        3     { R 0 RPUSH $k [string repeat "l" [expr {int(rand() * 200) + 1}]] }
+                        4     { catch { R 0 DEL $k } }
+                    }
+                }
+            }
+
+            # Verify every 10 operations.
+            if {$iter % 10 == 9} {
+                verify_slot_memory $key_slot
+                verify_slot_memory $key2_slot
+            }
+        }
+
+        # Final verification.
+        verify_slot_memory $key_slot
+        verify_slot_memory $key2_slot
+
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, eviction removes memory." {
+        # Fill the slot with keys, then set a tight maxmemory to trigger eviction.
+        for {set i 0} {$i < 20} {incr i} {
+            R 0 SET "{$key}:evict_$i" [string repeat "x" 500]
+        }
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before _
+        assert {$data_before > 0}
+
+        # Set maxmemory to trigger eviction of some keys.
+        set used [s 0 used_memory]
+        R 0 CONFIG SET maxmemory-policy allkeys-lru
+        R 0 CONFIG SET maxmemory [expr {$used - 2000}]
+
+        # Force eviction by trying to add data.
+        catch { R 0 SET "{$key}:trigger" [string repeat "y" 500] }
+
+        verify_slot_memory $key_slot
+
+        # Restore.
+        R 0 CONFIG SET maxmemory 0
+        R 0 CONFIG SET maxmemory-policy noeviction
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, hash field expiry reduces memory." {
+        # Create a hash with fields that have short TTL.
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        R 0 HSETEX $key EX 1 FIELDS 3 f1 v1 f2 v2 f3 v3
+        # Add some non-expiring fields too.
+        R 0 HSET $key persistent1 value1 persistent2 value2
+
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before overhead_before
+        assert {$data_before > 0}
+
+        # Wait for fields to expire.
+        after 2000
+
+        # Trigger active expiry by accessing any key — the server's
+        # activeExpireCycle will process expired hash fields.
+        R 0 PING
+
+        # The hash should still exist (persistent fields remain) but be smaller.
+        assert {[R 0 HLEN $key] == 2}
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_after _
+        assert {$data_after < $data_before}
+
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, hash field expiry deletes empty key." {
+        # Create a hash where ALL fields expire.
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        R 0 HSETEX $key EX 1 FIELDS 3 f1 v1 f2 v2 f3 v3
+
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before _
+        assert {$data_before > 0}
+
+        # Wait for all fields to expire.
+        after 2000
+        R 0 PING
+
+        # Key should be gone.
+        assert {[R 0 EXISTS $key] == 0}
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_after _
+        assert_equal $data_after 0
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, DEBUG RELOAD preserves correctness." {
+        # Create keys of various types.
+        R 0 SET "{$key}:str" [string repeat "a" 100]
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        for {set i 0} {$i < 30} {incr i} {
+            R 0 HSET "{$key}:hash" "f_$i" "v_$i"
+        }
+        for {set i 0} {$i < 200} {incr i} {
+            R 0 SADD "{$key}:set" "m_$i"
+        }
+        R 0 CONFIG SET hash-max-listpack-entries 128
+
+        verify_slot_memory $key_slot
+        lassign [get_slot_memory $key_slot] data_before overhead_before
+        assert {$data_before > 0}
+
+        # Reload from RDB — slot stats are rebuilt via dbAddRDBLoad hook.
+        R 0 DEBUG RELOAD
+
+        verify_slot_memory $key_slot
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, AOF reload preserves correctness." {
+        # Enable AOF and wait for any automatic rewrite to finish.
+        R 0 CONFIG SET appendonly yes
+        R 0 CONFIG SET aof-use-rdb-preamble yes
+        wait_for_condition 50 100 {
+            [s 0 aof_rewrite_in_progress] == 0
+        } else {
+            fail "AOF rewrite did not finish"
+        }
+
+        # Keys in the RDB preamble.
+        R 0 SET "{$key}:aof1" [string repeat "r" 100]
+        R 0 SET "{$key}:aof2" [string repeat "s" 200]
+        R 0 BGREWRITEAOF
+        wait_for_condition 50 100 {
+            [s 0 aof_rewrite_in_progress] == 0
+        } else {
+            fail "AOF rewrite did not finish"
+        }
+
+        # Keys in the RESP tail (written after the rewrite).
+        R 0 SET "{$key}:aof3" [string repeat "t" 300]
+        R 0 SET "{$key2}:aof4" [string repeat "u" 400]
+
+        # Reload from AOF (RDB preamble + RESP tail).
+        R 0 DEBUG LOADAOF
+
+        verify_slot_memory $key_slot
+        verify_slot_memory $key2_slot
+        lassign [get_slot_memory $key_slot] data1 _
+        lassign [get_slot_memory $key2_slot] data2 _
+        assert {$data1 > 0}
+        assert {$data2 > 0}
+
+        R 0 CONFIG SET appendonly no
+    }
+    R 0 FLUSHALL
+}

@@ -13,6 +13,12 @@ void clusterSlotStatsAddCpuDuration(client *c, ustime_t duration);
 /* network-bytes-in metric. */
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c);
 
+/* memory-data-bytes / memory-overhead-bytes metrics. */
+extern hashtableType keySizeCacheHashtableType;
+void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key);
+void clusterSlotStatsResetMemoryOnFlush(void);
+void clusterSlotStatsTrackRDBLoad(serverDb *db, sds key, robj *val);
+
 /* network-bytes-out metric. */
 void clusterSlotStatsAddNetworkBytesOutForSlot(int slot, unsigned long long net_bytes_out);
 void clusterSlotStatsAddNetworkBytesOutForUserClient(client *c);

@@ -2,6 +2,7 @@
 #include "bio.h"
 #include "functions.h"
 #include "cluster.h"
+#include "cluster_slot_stats.h"
 #include "module.h"
 
 #include <stdatomic.h>
@@ -217,6 +218,10 @@ void emptyDbAsync(serverDb *db) {
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
+    if (db->key_mem_cache) {
+        hashtableRelease(db->key_mem_cache);
+        db->key_mem_cache = hashtableCreate(&keySizeCacheHashtableType);
+    }
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
     bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldkeyswithexpires);
 }

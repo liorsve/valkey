@@ -1206,6 +1206,58 @@ size_t hashTypeLogicalSize(robj *o) {
     return 0;
 }
 
+/* O(1) logical size of a value object, split into user data bytes and
+ * container overhead bytes. Uses incrementally maintained tracked fields
+ * where available. For types without O(1) tracking (zset skiplist),
+ * returns 0 for both. Does not call zmalloc_size. */
+void objectLogicalSize(robj *o, size_t *data_bytes, size_t *overhead_bytes) {
+    *data_bytes = 0;
+    *overhead_bytes = 0;
+
+    if (o->type == OBJ_STRING) {
+        if (o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR) {
+            sds s = objectGetVal(o);
+            *data_bytes = sdsReqSize(sdslen(s), sdsType(s));
+        }
+    } else if (o->type == OBJ_LIST) {
+        if (o->encoding == OBJ_ENCODING_QUICKLIST) {
+            quicklist *ql = objectGetVal(o);
+            *data_bytes = ql->tracked_data_bytes;
+            *overhead_bytes = sizeof(quicklist) + ql->len * sizeof(quicklistNode);
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            *data_bytes = lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_SET) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            *data_bytes = hashtableTrackedDataBytes(ht);
+            *overhead_bytes = hashtableMemUsage(ht);
+        } else if (o->encoding == OBJ_ENCODING_INTSET) {
+            *data_bytes = intsetBlobLen(objectGetVal(o));
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            *data_bytes = lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_ZSET) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            *data_bytes = lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_HASH) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            *data_bytes = lpBytes(objectGetVal(o));
+        } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            vset *volatile_fields = hashtableMetadata(ht);
+            *data_bytes = hashtableTrackedDataBytes(ht);
+            *overhead_bytes = hashtableMemUsage(ht);
+            if (vsetIsValid(volatile_fields)) *overhead_bytes += vsetLogicalSize(volatile_fields);
+        }
+    } else if (o->type == OBJ_STREAM) {
+        stream *s = objectGetVal(o);
+        *data_bytes = s->tracked_data_bytes;
+        *overhead_bytes = s->tracked_overhead + sizeof(stream);
+    }
+}
+
 /* Returns the size in bytes consumed by the key's value in RAM.
  * Note that the returned value is just an approximation, especially in the
  * case of aggregated data types where only "sample_size" elements
