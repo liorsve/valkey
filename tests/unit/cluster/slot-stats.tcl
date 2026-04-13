@@ -1370,13 +1370,85 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
     }
     R 0 FLUSHALL
 
+    test "SLOT-STATS memory, hash rehash overhead repro." {
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        # Add fields until resize triggers, then verify after each.
+        for {set i 0} {$i < 100} {incr i} {
+            R 0 HSET $key "field_$i" [string repeat "v" 20]
+            lassign [get_slot_memory $key_slot] d o
+            if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
+                puts "FAIL at HSET field_$i: data=$d overhead=$o err=$err"
+                fail "hash rehash repro: $err"
+            }
+        }
+        # Now delete fields one by one and verify.
+        for {set i 0} {$i < 50} {incr i} {
+            R 0 HDEL $key "field_$i"
+            lassign [get_slot_memory $key_slot] d o
+            if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
+                puts "FAIL at HDEL field_$i: data=$d overhead=$o err=$err"
+                fail "hash rehash repro: $err"
+            }
+        }
+        # Add more to trigger another resize cycle.
+        for {set i 100} {$i < 200} {incr i} {
+            R 0 HSET $key "field_$i" [string repeat "w" 20]
+            lassign [get_slot_memory $key_slot] d o
+            if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
+                puts "FAIL at HSET field_$i (2nd wave): data=$d overhead=$o err=$err"
+                fail "hash rehash repro: $err"
+            }
+        }
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
+    test "SLOT-STATS memory, hash+set rehash overhead repro." {
+        R 0 CONFIG SET hash-max-listpack-entries 0
+        set hash_key "{$key}:hash"
+        set set_key "{$key}:set"
+
+        for {set round 0} {$round < 300} {incr round} {
+            R 0 FLUSHALL
+
+            # Grow hash and set to trigger resize on both.
+            for {set i 0} {$i < 30} {incr i} {
+                R 0 HSET $hash_key "f_$i" [string repeat "v" 20]
+                R 0 SADD $set_key "m_$i"
+            }
+
+            # Now interleave hash and set operations and verify.
+            for {set i 0} {$i < 50} {incr i} {
+                set op [expr {int(rand() * 4)}]
+                switch $op {
+                    0 { R 0 HSET $hash_key "f_[expr {int(rand() * 50)}]" [string repeat "x" 20] }
+                    1 { catch { R 0 HDEL $hash_key "f_[expr {int(rand() * 50)}]" } }
+                    2 { R 0 SADD $set_key "m_[expr {int(rand() * 200)}]" }
+                    3 { catch { R 0 SREM $set_key "m_[expr {int(rand() * 200)}]" } }
+                }
+
+                if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
+                    lassign [get_slot_memory $key_slot] d o
+                    puts "FAIL round=$round iter=$i op=$op data=$d overhead=$o err=$err"
+                    fail "hash+set rehash repro: $err"
+                }
+            }
+        }
+        R 0 CONFIG SET hash-max-listpack-entries 128
+    }
+    R 0 FLUSHALL
+
     test "SLOT-STATS memory, fuzzer: random operations across types and slots." {
         R 0 CONFIG SET hash-max-listpack-entries 0
 
         set slots [list $key_slot $key2_slot]
         set prefixes [list "{$key}" "{$key2}"]
         set types {string hash set list}
+
+        for {set round 0} {$round < 300} {incr round} {
+        R 0 FLUSHALL
         set counter 0
+        set history {}
 
         for {set iter 0} {$iter < 200} {incr iter} {
             # Pick a random slot and type.
@@ -1388,6 +1460,7 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
 
             # Pick a random operation.
             set op [expr {int(rand() * 5)}]
+            set cmd_desc "iter=$iter type=$type op=$op key=$k"
 
             switch $type {
                 string {
@@ -1400,6 +1473,7 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
                 }
                 hash {
                     set f "f_[expr {int(rand() * 50)}]"
+                    set cmd_desc "$cmd_desc field=$f"
                     switch $op {
                         0 - 1 { R 0 HSET $k $f [string repeat "h" [expr {int(rand() * 100) + 1}]] }
                         2     { catch { R 0 HDEL $k $f } }
@@ -1425,16 +1499,25 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
                 }
             }
 
-            # Verify every 10 operations.
-            if {$iter % 10 == 9} {
-                verify_slot_memory $key_slot
-                verify_slot_memory $key2_slot
+            lappend history $cmd_desc
+
+            # Verify only the modified key's slot.
+            foreach check_slot [list $slot] {
+                if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $check_slot} verify_result]} {
+                    lassign [get_slot_memory $check_slot] cur_data cur_overhead
+                    puts "FUZZER MISMATCH at $cmd_desc (round $round)"
+                    puts "  slot=$check_slot stats: data=$cur_data overhead=$cur_overhead"
+                    puts "  verify: $verify_result"
+                    puts "  --- full history (round $round) ---"
+                    foreach h $history {
+                        puts "  $h"
+                    }
+                    fail "FUZZER: $verify_result after $cmd_desc"
+                }
             }
         }
 
-        # Final verification.
-        verify_slot_memory $key_slot
-        verify_slot_memory $key2_slot
+        } ;# end round loop
 
         R 0 CONFIG SET hash-max-listpack-entries 128
     }

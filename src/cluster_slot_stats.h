@@ -16,8 +16,10 @@ void clusterSlotStatsAddNetworkBytesInForUserClient(client *c);
 /* memory-data-bytes / memory-overhead-bytes metrics. */
 extern hashtableType keySizeCacheHashtableType;
 void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key);
+void clusterSlotStatsHandleRehashOverhead(client *c);
 void clusterSlotStatsResetMemoryOnFlush(void);
 void clusterSlotStatsTrackRDBLoad(serverDb *db, sds key, robj *val);
+void clusterSlotStatsDefragKeySizeCache(void *privdata, void *entry_ref);
 
 /* network-bytes-out metric. */
 void clusterSlotStatsAddNetworkBytesOutForSlot(int slot, unsigned long long net_bytes_out);

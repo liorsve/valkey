@@ -43,6 +43,7 @@
 #include "eval.h"
 #include "script.h"
 #include "module.h"
+#include "cluster_slot_stats.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -1023,6 +1024,34 @@ static doneStatus defragModuleGlobals(monotime endtime, void *target, void *priv
 }
 
 
+static doneStatus defragStageKeyMemCache(monotime endtime, void *target, void *privdata) {
+    static unsigned long cursor = 0;
+    UNUSED(privdata);
+
+    int dbid = (uintptr_t)target;
+    serverDb *db = server.db[dbid];
+
+    if (endtime == 0) {
+        /* Initialization: defrag the hashtable struct and reset cursor. */
+        if (db && db->key_mem_cache) {
+            hashtable *new_ht = hashtableDefragTables(db->key_mem_cache, activeDefragAlloc);
+            if (new_ht) db->key_mem_cache = new_ht;
+        }
+        cursor = 0;
+        return DEFRAG_NOT_DONE;
+    }
+
+    if (!db || !db->key_mem_cache) return DEFRAG_DONE;
+
+    /* Scan entries in time-bounded chunks. */
+    do {
+        cursor = hashtableScanDefrag(db->key_mem_cache, cursor, clusterSlotStatsDefragKeySizeCache, NULL,
+                                     activeDefragAlloc, HASHTABLE_SCAN_EMIT_REF);
+    } while (cursor != 0 && getMonotonicUs() < endtime);
+
+    return (cursor == 0) ? DEFRAG_DONE : DEFRAG_NOT_DONE;
+}
+
 static bool defragIsRunning(void) {
     return (defrag.timeproc_id > 0);
 }
@@ -1263,6 +1292,7 @@ static void beginDefragCycle(void) {
         addDefragStage(defragStageDbKeys, (void *)(uintptr_t)dbid, NULL);
         addDefragStage(defragStageExpiresKvstore, (void *)(uintptr_t)dbid, NULL);
         addDefragStage(defragStageKeysWithvolaItemsKvstore, (void *)(uintptr_t)dbid, NULL);
+        addDefragStage(defragStageKeyMemCache, (void *)(uintptr_t)dbid, NULL);
     }
 
     static getClientChannelsFnWrapper getClientPubSubChannelsFn = {getClientPubSubChannels};

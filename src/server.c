@@ -3927,6 +3927,15 @@ void call(client *c, int flags) {
 
     c->cmd->proc(c);
 
+    /* Hash/set reads can change hashtable overhead via incremental rehashing
+     * without signalModifiedKey firing. Check for overhead drift on argv[1]
+     * only when the key is hashtable-encoded and mid-rehash (checked inside). */
+    if (server.dirty == dirty && c->argc >= 2 && !c->flag.blocked &&
+        clusterSlotStatsEnabled(c->slot) &&
+        (c->cmd->group == COMMAND_GROUP_HASH || c->cmd->group == COMMAND_GROUP_SET)) {
+        clusterSlotStatsHandleRehashOverhead(c);
+    }
+
     exitExecutionUnit();
 
     /* In case client is blocked after trying to execute the command,

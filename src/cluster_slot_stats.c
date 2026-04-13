@@ -430,6 +430,62 @@ void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key) {
     }
 }
 
+/* Called from call() after read commands on hashtable-encoded values.
+ * Detects overhead changes from incremental rehashing during reads.
+ * Compares current hashtableMemUsage against the cached overhead —
+ * only refreshes the cache when they differ. O(1) per call. */
+void clusterSlotStatsHandleRehashOverhead(client *c) {
+    if (!c->db->key_mem_cache) return;
+
+    sds keyname = objectGetVal(c->argv[1]);
+    int slot = keyHashSlot(keyname, (int)sdslen(keyname));
+    void *found = NULL;
+    if (!kvstoreHashtableFind(c->db->keys, slot, keyname, &found)) return;
+    robj *val = found;
+
+    /* Only hashtable-encoded values have rehashing overhead drift. */
+    if (!val) return;
+    if (val->encoding != OBJ_ENCODING_HASHTABLE) return;
+    if (val->type != OBJ_SET && val->type != OBJ_HASH) return;
+
+    hashtable *ht = objectGetVal(val);
+    size_t current_overhead = hashtableMemUsage(ht);
+    if (val->type == OBJ_HASH) {
+        vset *volatile_fields = hashtableMetadata(ht);
+        if (vsetIsValid(volatile_fields)) current_overhead += vsetLogicalSize(volatile_fields);
+    }
+
+    /* Check if cached overhead differs from current. */
+    void *cache_entry = NULL;
+    if (!hashtableFind(c->db->key_mem_cache, keyname, &cache_entry)) return;
+    keySizeCacheEntry *cached = cache_entry;
+    if (cached->overhead_bytes == current_overhead) return;
+
+    /* Overhead changed — update slot stats and cache. */
+    int64_t delta = (int64_t)current_overhead - (int64_t)cached->overhead_bytes;
+    server.cluster->slot_stats[slot].overhead_bytes += delta;
+    cached->overhead_bytes = current_overhead;
+}
+
+/* Active-defrag callback for key_mem_cache entries.
+ * Called via hashtableScanDefrag with HASHTABLE_SCAN_EMIT_REF. */
+void clusterSlotStatsDefragKeySizeCache(void *privdata, void *entry_ref) {
+    UNUSED(privdata);
+    keySizeCacheEntry **ref = (keySizeCacheEntry **)entry_ref;
+    keySizeCacheEntry *entry = *ref;
+
+    /* Try to defrag the entry struct itself. */
+    keySizeCacheEntry *newentry = activeDefragAlloc(entry);
+    if (newentry) {
+        entry = newentry;
+        *ref = newentry;
+    }
+
+    /* Try to defrag the sds key. */
+    sds newsds = activeDefragSds(entry->key);
+    if (newsds) entry->key = newsds;
+}
+
 /* Called from signalFlushedDb to reset memory counters on FLUSHALL/FLUSHDB. */
 void clusterSlotStatsResetMemoryOnFlush(void) {
     if (!server.cluster_enabled || !server.cluster_slot_stats_enabled) return;
