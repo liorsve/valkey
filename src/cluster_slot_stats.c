@@ -352,17 +352,22 @@ int clusterSlotStatsEnabled(int slot) {
  * dbFind (safe even if argv was rewritten during command execution).
  * -------------------------------------------------------------------------- */
 
+/* Look up a key and return its logical size. Returns zeros if the key doesn't exist. */
+static void getKeyLogicalSize(serverDb *db, sds keyname, size_t *data, size_t *overhead) {
+    *data = 0;
+    *overhead = 0;
+    robj *val = dbFind(db, keyname);
+    if (val) objectLogicalSize(val, data, overhead);
+}
+
 static void sumKeysByName(client *c, sds *keynames, int count, size_t *data_total, size_t *overhead_total) {
     *data_total = 0;
     *overhead_total = 0;
     for (int i = 0; i < count; i++) {
-        robj *val = dbFind(c->db, keynames[i]);
-        if (val) {
-            size_t d, o;
-            objectLogicalSize(val, &d, &o);
-            *data_total += d;
-            *overhead_total += o;
-        }
+        size_t d, o;
+        getKeyLogicalSize(c->db, keynames[i], &d, &o);
+        *data_total += d;
+        *overhead_total += o;
     }
 }
 
@@ -404,6 +409,32 @@ void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk) {
 
     if (data_delta != 0) server.cluster->slot_stats[c->slot].data_bytes += data_delta;
     if (overhead_delta != 0) server.cluster->slot_stats[c->slot].overhead_bytes += overhead_delta;
+}
+
+/* Lightweight pre-command check for hash/set reads: only snapshot overhead
+ * if the key is hashtable-encoded AND mid-rehash (the only case where a
+ * read can change overhead via incremental rehashing). Returns 1 if the
+ * after-hook should run, 0 if it can be skipped. */
+int clusterSlotStatsSnapshotRehashOverhead(client *c) {
+    sds keyname = objectGetVal(c->argv[1]);
+    robj *val = dbFind(c->db, keyname);
+    if (!val || val->encoding != OBJ_ENCODING_HASHTABLE) return 0;
+    if (val->type != OBJ_SET && val->type != OBJ_HASH) return 0;
+    if (!hashtableIsRehashing(objectGetVal(val))) return 0;
+
+    size_t d, o;
+    objectLogicalSize(val, &d, &o);
+    c->slot_mem_overhead_before = o;
+    return 1;
+}
+
+/* Post-command check: re-read overhead for argv[1] and apply delta. */
+void clusterSlotStatsApplyRehashOverhead(client *c) {
+    size_t d, overhead_after;
+    getKeyLogicalSize(c->db, objectGetVal(c->argv[1]), &d, &overhead_after);
+
+    int64_t delta = (int64_t)overhead_after - (int64_t)c->slot_mem_overhead_before;
+    if (delta != 0) server.cluster->slot_stats[c->slot].overhead_bytes += delta;
 }
 
 /* Recount slot memory stats from scratch by walking all keys in all slots.

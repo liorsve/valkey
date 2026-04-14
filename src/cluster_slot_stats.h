@@ -23,6 +23,8 @@ typedef struct slotMemKeys {
 void clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk);
 void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk);
 void clusterSlotStatsFreeKeys(slotMemKeys *sk);
+int clusterSlotStatsSnapshotRehashOverhead(client *c);
+void clusterSlotStatsApplyRehashOverhead(client *c);
 void clusterSlotStatsRecountMemory(void);
 
 /* network-bytes-out metric. */
