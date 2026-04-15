@@ -3912,13 +3912,13 @@ void call(client *c, int flags) {
      * since incremental rehashing can change overhead without a write. */
     int slot_mem_enabled = clusterSlotStatsEnabled(c->slot);
     int track_slot_write_memory = slot_mem_enabled && (c->cmd->flags & CMD_WRITE);
-    int track_rehash_overhead = 0;
+    size_t slot_mem_before = 0;
     slotMemKeys slot_mem_keys;
     if (track_slot_write_memory) {
-        clusterSlotStatsSnapshotMemoryBefore(c, &slot_mem_keys);
+        slot_mem_before = clusterSlotStatsSnapshotMemoryBefore(c, &slot_mem_keys);
     } else if (slot_mem_enabled && c->cmd->key_specs_num > 0 && c->argc >= 2 &&
                (c->cmd->group == COMMAND_GROUP_HASH || c->cmd->group == COMMAND_GROUP_SET)) {
-        track_rehash_overhead = clusterSlotStatsSnapshotRehashOverhead(c);
+        slot_mem_before = clusterSlotStatsSnapshotRehashOverhead(c);
     }
 
     const ustime_t call_timer = ustime();
@@ -3943,14 +3943,14 @@ void call(client *c, int flags) {
     /* Apply per-slot memory deltas after the command. */
     if (track_slot_write_memory) {
         if (!c->flag.blocked) {
-            clusterSlotStatsApplyMemoryAfter(c, &slot_mem_keys);
+            clusterSlotStatsApplyMemoryAfter(c, &slot_mem_keys, slot_mem_before);
         } else {
             /* Command blocked — free the saved key names without applying deltas.
              * The delta will be captured when the command is reprocessed after unblocking. */
             clusterSlotStatsFreeKeys(&slot_mem_keys);
         }
-    } else if (track_rehash_overhead && !c->flag.blocked) {
-        clusterSlotStatsApplyRehashOverhead(c);
+    } else if (slot_mem_before && !c->flag.blocked) {
+        clusterSlotStatsApplyRehashOverhead(c, slot_mem_before);
     }
 
     /* In case client is blocked after trying to execute the command,

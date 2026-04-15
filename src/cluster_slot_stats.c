@@ -354,8 +354,9 @@ static size_t sumKeysByName(client *c, sds *keynames, int count) {
     return total;
 }
 
-/* Called from call() before c->cmd->proc(c) for write commands. */
-void clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk) {
+/* Called from call() before c->cmd->proc(c) for write commands.
+ * Returns the total logical size of all keys before the command. */
+size_t clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk) {
     getKeysResult result;
     initGetKeysResult(&result);
     getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
@@ -368,7 +369,7 @@ void clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk) {
     }
     getKeysFreeResult(&result);
 
-    c->slot_mem_before = sumKeysByName(c, sk->keys, sk->count);
+    return sumKeysByName(c, sk->keys, sk->count);
 }
 
 /* Free saved key name copies without applying deltas. Called when the
@@ -382,35 +383,34 @@ void clusterSlotStatsFreeKeys(slotMemKeys *sk) {
 
 /* Called from call() after c->cmd->proc(c). Looks up the saved key names
  * (safe even after argv rewrite), computes deltas, and frees key copies. */
-void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk) {
+void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk, size_t before) {
     size_t after = sumKeysByName(c, sk->keys, sk->count);
     clusterSlotStatsFreeKeys(sk);
 
-    int64_t delta = (int64_t)after - (int64_t)c->slot_mem_before;
+    int64_t delta = (int64_t)after - (int64_t)before;
     if (delta != 0) server.cluster->slot_stats[c->slot].memory_logical_bytes += delta;
 }
 
 /* Lightweight pre-command check for hash/set reads: only snapshot overhead
  * if the key is hashtable-encoded AND mid-rehash (the only case where a
- * read can change overhead via incremental rehashing). Returns 1 if the
- * after-hook should run, 0 if it can be skipped. */
-int clusterSlotStatsSnapshotRehashOverhead(client *c) {
+ * read can change overhead via incremental rehashing). Returns the
+ * pre-command logical size, or 0 if the after-hook can be skipped. */
+size_t clusterSlotStatsSnapshotRehashOverhead(client *c) {
     sds keyname = objectGetVal(c->argv[1]);
     robj *val = dbFind(c->db, keyname);
     if (!val || val->encoding != OBJ_ENCODING_HASHTABLE) return 0;
     if (val->type != OBJ_SET && val->type != OBJ_HASH) return 0;
     if (!hashtableIsRehashing(objectGetVal(val))) return 0;
 
-    c->slot_mem_before = objectLogicalSize(val);
-    return 1;
+    return objectLogicalSize(val);
 }
 
 /* Post-command check: re-read logical size for argv[1] and apply delta. */
-void clusterSlotStatsApplyRehashOverhead(client *c) {
+void clusterSlotStatsApplyRehashOverhead(client *c, size_t before) {
     robj *val = dbFind(c->db, objectGetVal(c->argv[1]));
     size_t after = val ? objectLogicalSize(val) : 0;
 
-    int64_t delta = (int64_t)after - (int64_t)c->slot_mem_before;
+    int64_t delta = (int64_t)after - (int64_t)before;
     if (delta != 0) server.cluster->slot_stats[c->slot].memory_logical_bytes += delta;
 }
 

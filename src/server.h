@@ -1402,7 +1402,6 @@ typedef struct client {
     unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
     unsigned long long commands_processed;        /* Total count of commands this client executed. */
     unsigned long long net_output_bytes_curr_cmd; /* Total network output bytes sent to this client, by the current command. */
-    size_t slot_mem_before;                       /* Slot memory: logical bytes before current command. */
     size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
     int nwritten;                                 /* Number of bytes of the last write. */
     int nread;                                    /* Number of bytes of the last read. */
