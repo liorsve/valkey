@@ -1,0 +1,734 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Integration tests for stream tracked_data_bytes and tracked_overhead
+ * (Option D: single stream-level counters, no rax callbacks).
+ */
+
+#include "generated_wrappers.hpp"
+
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+extern "C" {
+#include "listpack.h"
+#include "rax.h"
+#include "sds.h"
+#include "server.h"
+#include "stream.h"
+
+int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id, int seq_given);
+streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, long long entries_read);
+streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid, int flags);
+streamNACK *streamCreateNACK(streamConsumer *consumer);
+void streamFreeNACK(streamNACK *na);
+void streamDelConsumer(streamCG *cg, streamConsumer *consumer);
+void freeStream(stream *s);
+int64_t streamTrimByLength(stream *s, long long maxlen, int approx);
+int64_t streamTrimByID(stream *s, streamID minid, int approx);
+void streamEncodeID(void *buf, streamID *id);
+robj *streamDup(robj *o);
+void streamFreeCG(streamCG *cg);
+size_t raxComputeLogicalSize(rax *rax);
+}
+
+class StreamTrackingTest : public ::testing::Test {};
+
+/* ── Ground truth: walk everything and compute sizes ──────────────────── */
+
+static size_t computeDataBytesWalk(stream *s) {
+    size_t total = 0;
+    /* Listpacks */
+    raxIterator ri;
+    raxStart(&ri, s->rax);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) total += lpBytes((unsigned char *)ri.data);
+    raxStop(&ri);
+    /* Consumer names */
+    if (s->cgroups) {
+        raxStart(&ri, s->cgroups);
+        raxSeek(&ri, "^", NULL, 0);
+        while (raxNext(&ri)) {
+            streamCG *cg = (streamCG *)ri.data;
+            total += sizeof(streamCG);
+            total += raxSize(cg->pel) * sizeof(streamNACK);
+            raxIterator ci;
+            raxStart(&ci, cg->consumers);
+            raxSeek(&ci, "^", NULL, 0);
+            while (raxNext(&ci)) {
+                streamConsumer *sc = (streamConsumer *)ci.data;
+                total += sizeof(streamConsumer);
+                total += sdsReqSize(sdslen(sc->name), sdsType(sc->name));
+            }
+            raxStop(&ci);
+        }
+        raxStop(&ri);
+    }
+    return total;
+}
+
+/* Use raxComputeLogicalSize (O(n) walk) instead of raxLogicalSize (field read)
+ * so the ground truth is independent of the logical_size field. This catches
+ * drift bugs like the iskey sizeof(void*) fix. */
+static size_t computeOverheadWalk(stream *s) {
+    size_t total = 0;
+    total += raxComputeLogicalSize(s->rax);
+    if (s->cgroups) {
+        total += raxComputeLogicalSize(s->cgroups);
+        raxIterator ri;
+        raxStart(&ri, s->cgroups);
+        raxSeek(&ri, "^", NULL, 0);
+        while (raxNext(&ri)) {
+            streamCG *cg = (streamCG *)ri.data;
+            total += raxComputeLogicalSize(cg->pel);
+            total += raxComputeLogicalSize(cg->consumers);
+            raxIterator ci;
+            raxStart(&ci, cg->consumers);
+            raxSeek(&ci, "^", NULL, 0);
+            while (raxNext(&ci)) {
+                streamConsumer *sc = (streamConsumer *)ci.data;
+                total += raxComputeLogicalSize(sc->pel);
+            }
+            raxStop(&ci);
+        }
+        raxStop(&ri);
+    }
+    return total;
+}
+
+#define ASSERT_STREAM_TRACKING(s)                                   \
+    do {                                                            \
+        ASSERT_EQ((s)->tracked_data_bytes, computeDataBytesWalk(s)) \
+            << "tracked_data_bytes mismatch";                       \
+        ASSERT_EQ((s)->tracked_overhead, computeOverheadWalk(s))    \
+            << "tracked_overhead mismatch";                         \
+    } while (0)
+
+/* ── Helpers ──────────────────────────────────────────────────────────── */
+
+static streamID appendEntry(stream *s, const char *field, const char *value) {
+    robj *argv[2];
+    argv[0] = createStringObject(field, strlen(field));
+    argv[1] = createStringObject(value, strlen(value));
+    streamID id;
+    streamAppendItem(s, argv, 1, &id, NULL, 0);
+    decrRefCount(argv[0]);
+    decrRefCount(argv[1]);
+    return id;
+}
+
+/* ── 1. Append entries ────────────────────────────────────────────────── */
+TEST_F(StreamTrackingTest, AppendEntries) {
+    stream *s = streamNew();
+    server.stream_node_max_entries = 10;
+
+    uint64_t nodes_before = raxSize(s->rax);
+    for (int i = 0; i < 100; i++) {
+        char f[16], v[32];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "value_%d_data", i);
+        appendEntry(s, f, v);
+        ASSERT_STREAM_TRACKING(s);
+    }
+
+    /* With max_entries=10, 100 entries must span multiple rax nodes,
+     * confirming both "append to existing" and "new node" paths. */
+    ASSERT_GT(raxSize(s->rax), nodes_before);
+    ASSERT_EQ(raxSize(s->rax), 10ul);
+
+    server.stream_node_max_entries = 100;
+    freeStream(s);
+}
+
+/* ── 2. Trim ──────────────────────────────────────────────────────────── */
+TEST_F(StreamTrackingTest, Trim) {
+    stream *s = streamNew();
+    server.stream_node_max_entries = 10;
+
+    for (int i = 0; i < 100; i++) {
+        char f[16], v[64];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "value_%d_with_padding", i);
+        appendEntry(s, f, v);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    streamTrimByLength(s, 5, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    server.stream_node_max_entries = 100;
+    freeStream(s);
+}
+
+/* ── 2b. Trim by ID (MINID strategy) ────────────────────────────────── */
+TEST_F(StreamTrackingTest, TrimByID) {
+    stream *s = streamNew();
+    server.stream_node_max_entries = 10;
+
+    streamID ids[50];
+    for (int i = 0; i < 50; i++) {
+        char f[16], v[32];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "value_%d", i);
+        ids[i] = appendEntry(s, f, v);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* 50 entries across 5 nodes (max_entries=10). Trim by the 35th ID —
+     * should remove 3 whole nodes + some in-place deletions. */
+    ASSERT_EQ(raxSize(s->rax), 5ul);
+    uint64_t nodes_before = raxSize(s->rax);
+    streamTrimByID(s, ids[35], 0);
+    ASSERT_STREAM_TRACKING(s);
+    ASSERT_LT(raxSize(s->rax), nodes_before);
+
+    server.stream_node_max_entries = 100;
+    freeStream(s);
+}
+
+/* ── 3. Trim encoding boundary (count crosses 128) ───────────────────
+ *
+ * Listpack stores integers in variable-width encoding: values 0-127 use
+ * 7-bit (1 byte), values 128+ use 13-bit (2 bytes). The "valid entries"
+ * counter in the listpack header is one such integer.
+ *
+ * We insert 129 entries into a single node so the counter = 129 (13-bit).
+ * Trimming 2 entries sets the counter to 127 (7-bit), shrinking the
+ * listpack by 1 byte. This tests that the in-place lpReplaceInteger
+ * delta is tracked correctly even when encoding width changes. */
+TEST_F(StreamTrackingTest, TrimEncodingBoundary) {
+    stream *s = streamNew();
+    server.stream_node_max_entries = 200;
+    server.stream_node_max_bytes = 0;
+
+    for (int i = 0; i < 129; i++) {
+        char f[16], v[16];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "v%d", i);
+        appendEntry(s, f, v);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* All 129 entries fit in one node (max_entries=200, max_bytes=unlimited). */
+    ASSERT_EQ(raxSize(s->rax), 1ul);
+
+    size_t bytes_before = s->tracked_data_bytes;
+    streamTrimByLength(s, 127, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* The counter crossed 128→127, changing encoding from 13-bit to 7-bit.
+     * This must cause a 1-byte decrease in lpBytes. */
+    ASSERT_EQ(bytes_before - s->tracked_data_bytes, 1ul);
+
+    server.stream_node_max_entries = 100;
+    server.stream_node_max_bytes = 4096;
+    freeStream(s);
+}
+
+/* ── 4. Iterator remove all entries ───────────────────────────────────── */
+TEST_F(StreamTrackingTest, IteratorRemoveAll) {
+    stream *s = streamNew();
+
+    streamID ids[5];
+    for (int i = 0; i < 5; i++) {
+        char f[16], v[16];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "v%d", i);
+        ids[i] = appendEntry(s, f, v);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        streamIterator si;
+        streamIteratorStart(&si, s, &ids[i], &ids[i], 0);
+        streamID myid;
+        int64_t numfields;
+        if (streamIteratorGetID(&si, &myid, &numfields)) {
+            streamIteratorRemoveEntry(&si, &myid);
+        }
+        streamIteratorStop(&si);
+        ASSERT_STREAM_TRACKING(s);
+    }
+    ASSERT_EQ(s->tracked_data_bytes, 0ul);
+
+    freeStream(s);
+}
+
+/* ── 5. CG create ─────────────────────────────────────────────────────── */
+TEST_F(StreamTrackingTest, ConsumerGroupCreate) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCreateCG(s, (char *)"grp1", 4, &zero, 0);
+    streamCreateCG(s, (char *)"grp2", 4, &zero, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    freeStream(s);
+}
+
+/* ── 6. Full lifecycle ────────────────────────────────────────────────── */
+TEST_F(StreamTrackingTest, FullLifecycle) {
+    stream *s = streamNew();
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Add entries */
+    streamID ids[30];
+    for (int i = 0; i < 30; i++) {
+        char f[16], v[32];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "val_%d", i);
+        ids[i] = appendEntry(s, f, v);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Create CG */
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"workers", 7, &zero, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Create consumers. streamCreateConsumer doesn't take stream *s —
+     * tracking is done by command handlers (XREADGROUP, XCLAIM, etc.).
+     * We mirror their tracking here since we can't invoke commands
+     * without a full server. */
+    robj *key = createStringObject("mystream", 8);
+    sds name1 = sdsnew("alice");
+    sds name2 = sdsnew("bob_with_longer_name");
+    size_t cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c1 = streamCreateConsumer(cg, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(c1->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+    cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c2 = streamCreateConsumer(cg, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(c2->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Deliver NACKs. In production this happens inside streamReplyWithRange
+     * (XREADGROUP), which requires a full client connection. We do the raw
+     * rax inserts and mirror streamReplyWithRange's tracking. */
+    for (int i = 0; i < 10; i++) {
+        streamNACK *nack = streamCreateNACK(c1);
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf, &ids[i]);
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
+        size_t cpel_before = raxLogicalSize(c1->pel);
+        raxInsert(c1->pel, buf, sizeof(buf), nack, NULL);
+        s->tracked_data_bytes += sizeof(streamNACK);
+        s->tracked_overhead += (raxLogicalSize(cg->pel) - gpel_before) + (raxLogicalSize(c1->pel) - cpel_before);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* ACK 5 NACKs. In production this is xackCommand, which requires a
+     * full client. We do the raw rax removals and mirror its tracking. */
+    for (int i = 0; i < 5; i++) {
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf, &ids[i]);
+        void *result;
+        raxFind(cg->pel, buf, sizeof(buf), &result);
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        raxRemove(cg->pel, buf, sizeof(buf), NULL);
+        size_t cpel_before = raxLogicalSize(c1->pel);
+        raxRemove(c1->pel, buf, sizeof(buf), NULL);
+        streamFreeNACK((streamNACK *)result);
+        s->tracked_data_bytes -= sizeof(streamNACK);
+        s->tracked_overhead -= (gpel_before - raxLogicalSize(cg->pel)) + (cpel_before - raxLogicalSize(c1->pel));
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete consumer c2 (0 NACKs). streamDelConsumer doesn't take
+     * stream *s — tracking is done by the DELCONSUMER command handler.
+     * We capture raxLogicalSize before/after to mirror its pattern. */
+    size_t gpel_before = raxLogicalSize(cg->pel);
+    size_t cons_before2 = raxLogicalSize(cg->consumers);
+    size_t cpel_size = raxLogicalSize(c2->pel);
+    s->tracked_data_bytes -= sizeof(streamConsumer);
+    s->tracked_data_bytes -= sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+    streamDelConsumer(cg, c2);
+    s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before2 - raxLogicalSize(cg->consumers));
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Trim */
+    streamTrimByLength(s, 10, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    sdsfree(name1);
+    sdsfree(name2);
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* ── 7. XGROUP DESTROY — destroy one CG while stream survives ────────── */
+TEST_F(StreamTrackingTest, DestroyConsumerGroup) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCreateCG(s, (char *)"grp1", 4, &zero, 0);
+    streamCG *cg2 = streamCreateCG(s, (char *)"grp2", 4, &zero, 0);
+
+    /* Create consumers — mirrors command handler tracking. */
+    robj *key = createStringObject("mystream", 8);
+    sds name1 = sdsnew("worker_alpha");
+    sds name2 = sdsnew("worker_beta_longer");
+    size_t cons_before = raxLogicalSize(cg2->consumers);
+    streamConsumer *c1 = streamCreateConsumer(cg2, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(c1->pel) + (raxLogicalSize(cg2->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+    cons_before = raxLogicalSize(cg2->consumers);
+    streamConsumer *c2 = streamCreateConsumer(cg2, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(c2->pel) + (raxLogicalSize(cg2->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+
+    streamID ids[10];
+    for (int i = 0; i < 10; i++) {
+        char f[16], v[16];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "v%d", i);
+        ids[i] = appendEntry(s, f, v);
+    }
+    /* Deliver NACKs — mirrors streamReplyWithRange (XREADGROUP). */
+    for (int i = 0; i < 7; i++) {
+        streamNACK *nack = streamCreateNACK(i < 4 ? c1 : c2);
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf, &ids[i]);
+        streamConsumer *target = (i < 4 ? c1 : c2);
+        size_t gpel_before = raxLogicalSize(cg2->pel);
+        raxInsert(cg2->pel, buf, sizeof(buf), nack, NULL);
+        size_t cpel_before = raxLogicalSize(target->pel);
+        raxInsert(target->pel, buf, sizeof(buf), nack, NULL);
+        s->tracked_data_bytes += sizeof(streamNACK);
+        s->tracked_overhead += (raxLogicalSize(cg2->pel) - gpel_before) + (raxLogicalSize(target->pel) - cpel_before);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Destroy cg2 — mirrors xgroupCommand DESTROY handler exactly:
+     * remove from s->cgroups rax, subtract CG-level metadata, then
+     * free sub-trees with context callbacks that subtract NACKs,
+     * consumers, and names. */
+    size_t cgroups_before = raxLogicalSize(s->cgroups);
+    raxRemove(s->cgroups, (unsigned char *)"grp2", 4, NULL);
+    s->tracked_data_bytes -= sizeof(streamCG);
+    s->tracked_overhead -= raxLogicalSize(cg2->pel) +
+                           raxLogicalSize(cg2->consumers) +
+                           (cgroups_before - raxLogicalSize(s->cgroups));
+    raxFreeWithCallbackAndContext(cg2->pel, streamFreeNACKWithTracking, s);
+    raxFreeWithCallbackAndContext(cg2->consumers, streamFreeConsumerWithTracking, s);
+    zfree(cg2);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* grp1 still exists — stream should still have valid tracking */
+    ASSERT_GT(s->tracked_overhead, 0ul);
+
+    sdsfree(name1);
+    sdsfree(name2);
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* ── 8. streamDelConsumer with NACKs ──────────────────────────────────── */
+TEST_F(StreamTrackingTest, DelConsumerWithNACKs) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"grp", 3, &zero, 0);
+
+    /* Create consumer — mirrors command handler tracking (XREADGROUP,
+     * XCLAIM, etc.). streamCreateConsumer doesn't take stream *s. */
+    robj *key = createStringObject("mystream", 8);
+    sds name = sdsnew("busy_consumer");
+    size_t cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *consumer = streamCreateConsumer(cg, name, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(consumer->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
+
+    /* Deliver 8 NACKs — mirrors streamReplyWithRange (XREADGROUP). */
+    streamID ids[8];
+    for (int i = 0; i < 8; i++) {
+        char f[16], v[16];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "v%d", i);
+        ids[i] = appendEntry(s, f, v);
+
+        streamNACK *nack = streamCreateNACK(consumer);
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf, &ids[i]);
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
+        size_t cpel_before = raxLogicalSize(consumer->pel);
+        raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
+        s->tracked_data_bytes += sizeof(streamNACK);
+        s->tracked_overhead += (raxLogicalSize(cg->pel) - gpel_before) + (raxLogicalSize(consumer->pel) - cpel_before);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete consumer — mirrors xgroupCommand DELCONSUMER. streamDelConsumer
+     * doesn't take stream *s, so we capture rax sizes before and compute
+     * deltas after, just like the command handler does. */
+    long long pending = raxSize(consumer->pel);
+    size_t gpel_before = raxLogicalSize(cg->pel);
+    size_t cons_before2 = raxLogicalSize(cg->consumers);
+    size_t cpel_size = raxLogicalSize(consumer->pel);
+    s->tracked_data_bytes -= sizeof(streamConsumer) + pending * sizeof(streamNACK);
+    s->tracked_data_bytes -= sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
+    streamDelConsumer(cg, consumer);
+    s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before2 - raxLogicalSize(cg->consumers));
+    ASSERT_STREAM_TRACKING(s);
+
+    sdsfree(name);
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* ── 9. streamDup — copy stream with CGs, consumers, NACKs ──────────── */
+TEST_F(StreamTrackingTest, StreamDup) {
+    stream *s = streamNew();
+
+    for (int i = 0; i < 20; i++) {
+        char f[16], v[32];
+        snprintf(f, sizeof(f), "f%d", i);
+        snprintf(v, sizeof(v), "value_%d", i);
+        appendEntry(s, f, v);
+    }
+
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"grp", 3, &zero, 0);
+
+    /* Create consumer — mirrors command handler tracking. */
+    robj *key = createStringObject("mystream", 8);
+    sds name = sdsnew("consumer_one");
+    size_t cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *consumer = streamCreateConsumer(cg, name, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_overhead += raxLogicalSize(consumer->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    s->tracked_data_bytes += sdsReqSize(sdslen(consumer->name), sdsType(consumer->name));
+
+    /* Deliver NACKs — mirrors streamReplyWithRange (XREADGROUP). */
+    streamID ids[5];
+    for (int i = 0; i < 5; i++) {
+        char f[16], v[16];
+        snprintf(f, sizeof(f), "nf%d", i);
+        snprintf(v, sizeof(v), "nv%d", i);
+        ids[i] = appendEntry(s, f, v);
+
+        streamNACK *nack = streamCreateNACK(consumer);
+        unsigned char buf[sizeof(streamID)];
+        streamEncodeID(buf, &ids[i]);
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        raxInsert(cg->pel, buf, sizeof(buf), nack, NULL);
+        size_t cpel_before = raxLogicalSize(consumer->pel);
+        raxInsert(consumer->pel, buf, sizeof(buf), nack, NULL);
+        s->tracked_data_bytes += sizeof(streamNACK);
+        s->tracked_overhead += (raxLogicalSize(cg->pel) - gpel_before) + (raxLogicalSize(consumer->pel) - cpel_before);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Duplicate */
+    robj *orig = createStreamObject();
+    /* Replace the empty stream inside with our populated one */
+    freeStream(static_cast<stream *>(objectGetVal(orig)));
+    objectSetVal(orig, s);
+
+    robj *copy = streamDup(orig);
+    stream *new_s = (stream *)objectGetVal(copy);
+
+    /* The copy should have identical tracking */
+    ASSERT_STREAM_TRACKING(new_s);
+
+    /* Both should have same totals */
+    ASSERT_EQ(s->tracked_data_bytes, new_s->tracked_data_bytes);
+    ASSERT_EQ(s->tracked_overhead, new_s->tracked_overhead);
+
+    objectSetVal(orig, NULL); /* prevent double-free of s */
+    decrRefCount(orig);
+    decrRefCount(copy);
+    sdsfree(name);
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* ── 10. Fuzzer: random mix of operations ─────────────────────────────── */
+TEST_F(StreamTrackingTest, Fuzzer) {
+    unsigned seed = static_cast<unsigned>(time(nullptr)) ^ static_cast<unsigned>(getpid());
+    srand(seed);
+    printf("  Fuzzer seed: %u\n", seed);
+
+    stream *s = streamNew();
+    robj *key = createStringObject("mystream", 8);
+    streamID zero = {0, 0};
+
+    /* Create a few CGs upfront */
+    streamCG *cgs[3];
+    for (int i = 0; i < 3; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "cg%d", i);
+        cgs[i] = streamCreateCG(s, name, strlen(name), &zero, 0);
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    std::vector<streamID> ids;
+    std::vector<std::pair<int, streamID>> pending; /* (cg_index, id) */
+
+    const int NUM_OPS = 2000;
+
+    for (int op = 0; op < NUM_OPS; op++) {
+        int action = rand() % 100;
+
+        if (action < 40 || ids.empty()) {
+            /* XADD: 40% */
+            char f[32];
+            snprintf(f, sizeof(f), "field_%d", op);
+            size_t vlen = 5 + (static_cast<size_t>(rand()) % 50);
+            std::string val(vlen, 'a' + (rand() % 26));
+            streamID id = appendEntry(s, f, val.c_str());
+            ids.push_back(id);
+        } else if (action < 55 && ids.size() > 20) {
+            /* XTRIM: 15% — trim to half */
+            streamTrimByLength(s, ids.size() / 2, 0);
+        } else if (action < 70) {
+            /* Create consumer: 15% — mirrors command handler tracking. */
+            int cg_idx = rand() % 3;
+            char cname[32];
+            snprintf(cname, sizeof(cname), "consumer_%d_%d", op, rand() % 1000);
+            sds sname = sdsnew(cname);
+            size_t cons_before = raxLogicalSize(cgs[cg_idx]->consumers);
+            streamConsumer *c = streamCreateConsumer(cgs[cg_idx], sname, key, 0,
+                                                     SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+            if (c) {
+                s->tracked_data_bytes += sizeof(streamConsumer);
+                s->tracked_overhead += raxLogicalSize(c->pel) + (raxLogicalSize(cgs[cg_idx]->consumers) - cons_before);
+                s->tracked_data_bytes += sdsReqSize(sdslen(c->name), sdsType(c->name));
+            }
+            sdsfree(sname);
+        } else if (action < 85 && !ids.empty()) {
+            /* Deliver NACK: 15% — mirrors streamReplyWithRange. */
+            int cg_idx = rand() % 3;
+            /* Pick a random consumer from this CG */
+            if (raxSize(cgs[cg_idx]->consumers) > 0) {
+                raxIterator ci;
+                raxStart(&ci, cgs[cg_idx]->consumers);
+                raxSeek(&ci, "^", NULL, 0);
+                raxNext(&ci);
+                streamConsumer *c = (streamConsumer *)ci.data;
+                raxStop(&ci);
+
+                /* Pick a random ID */
+                int idx = rand() % ids.size();
+                unsigned char buf[sizeof(streamID)];
+                streamEncodeID(buf, &ids[idx]);
+                streamNACK *nack = streamCreateNACK(c);
+                size_t gpel_before = raxLogicalSize(cgs[cg_idx]->pel);
+                if (raxTryInsert(cgs[cg_idx]->pel, buf, sizeof(buf), nack, NULL)) {
+                    size_t cpel_before = raxLogicalSize(c->pel);
+                    raxInsert(c->pel, buf, sizeof(buf), nack, NULL);
+                    s->tracked_data_bytes += sizeof(streamNACK);
+                    s->tracked_overhead += (raxLogicalSize(cgs[cg_idx]->pel) - gpel_before) + (raxLogicalSize(c->pel) - cpel_before);
+                    pending.push_back({cg_idx, ids[idx]});
+                } else {
+                    streamFreeNACK(nack);
+                }
+            }
+        } else if (!pending.empty()) {
+            /* ACK: remaining % — mirrors xackCommand. */
+            int idx = rand() % pending.size();
+            auto [cg_idx, ack_id] = pending[idx];
+            unsigned char buf[sizeof(streamID)];
+            streamEncodeID(buf, &ack_id);
+            void *result;
+            if (raxFind(cgs[cg_idx]->pel, buf, sizeof(buf), &result)) {
+                streamNACK *nack = (streamNACK *)result;
+                streamConsumer *nack_consumer = nack->consumer;
+                size_t gpel_before = raxLogicalSize(cgs[cg_idx]->pel);
+                raxRemove(cgs[cg_idx]->pel, buf, sizeof(buf), NULL);
+                size_t cpel_before = raxLogicalSize(nack_consumer->pel);
+                raxRemove(nack_consumer->pel, buf, sizeof(buf), NULL);
+                streamFreeNACK(nack);
+                s->tracked_data_bytes -= sizeof(streamNACK);
+                s->tracked_overhead -= (gpel_before - raxLogicalSize(cgs[cg_idx]->pel)) + (cpel_before - raxLogicalSize(nack_consumer->pel));
+            }
+            pending.erase(pending.begin() + idx);
+        }
+
+        /* Check tracking every 50 operations */
+        if (op % 50 == 0) {
+            ASSERT_STREAM_TRACKING(s);
+        }
+    }
+
+    /* Final check */
+    ASSERT_STREAM_TRACKING(s);
+
+    decrRefCount(key);
+    freeStream(s);
+}
+
+/* Test that rax logical_size correctly accounts for the sizeof(void*) data
+ * pointer slot when iskey is set/cleared. This triggers when a rax key is
+ * removed but its node has children (iskey cleared, node not freed).
+ * Consumer names that share prefixes create this scenario. */
+TEST_F(StreamTrackingTest, SharedPrefixConsumerRemoval) {
+    stream *s = streamNew();
+    appendEntry(s, "f", "v");
+
+    streamID zero = {0, 0};
+    streamCG *cg = streamCreateCG(s, (char *)"grp", 3, &zero, 0);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Create consumers with shared prefix — "worker" is a prefix of
+     * "worker_alpha". The rax node for "worker" will have iskey=1 AND
+     * children leading to "_alpha". */
+    robj *key = createStringObject("mystream", 8);
+    sds name1 = sdsnew("worker");
+    sds name2 = sdsnew("worker_alpha");
+    size_t cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c1 = streamCreateConsumer(cg, name1, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+    s->tracked_overhead += raxLogicalSize(c1->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    cons_before = raxLogicalSize(cg->consumers);
+    streamConsumer *c2 = streamCreateConsumer(cg, name2, key, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+    s->tracked_data_bytes += sizeof(streamConsumer);
+    s->tracked_data_bytes += sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+    s->tracked_overhead += raxLogicalSize(c2->pel) + (raxLogicalSize(cg->consumers) - cons_before);
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete "worker" — mirrors DELCONSUMER command handler. The rax node
+     * stays because "worker_alpha" still needs the "worker" prefix. iskey
+     * is cleared, shrinking the node's logical size by sizeof(void*). */
+    {
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        size_t cons_before = raxLogicalSize(cg->consumers);
+        size_t cpel_size = raxLogicalSize(c1->pel);
+        s->tracked_data_bytes -= sizeof(streamConsumer);
+        s->tracked_data_bytes -= sdsReqSize(sdslen(c1->name), sdsType(c1->name));
+        streamDelConsumer(cg, c1);
+        s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    /* Delete "worker_alpha" — now the remaining nodes can be fully freed */
+    {
+        size_t gpel_before = raxLogicalSize(cg->pel);
+        size_t cons_before = raxLogicalSize(cg->consumers);
+        size_t cpel_size = raxLogicalSize(c2->pel);
+        s->tracked_data_bytes -= sizeof(streamConsumer);
+        s->tracked_data_bytes -= sdsReqSize(sdslen(c2->name), sdsType(c2->name));
+        streamDelConsumer(cg, c2);
+        s->tracked_overhead -= cpel_size + (gpel_before - raxLogicalSize(cg->pel)) + (cons_before - raxLogicalSize(cg->consumers));
+    }
+    ASSERT_STREAM_TRACKING(s);
+
+    sdsfree(name1);
+    sdsfree(name2);
+    decrRefCount(key);
+    freeStream(s);
+}

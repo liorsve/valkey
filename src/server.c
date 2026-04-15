@@ -615,11 +615,18 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
+/* Return the logical size of an SDS entry: header + content + null terminator. */
+size_t sdsEntryGetSize(const void *entry) {
+    const_sds s = (const_sds)entry;
+    return sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+}
+
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = dictSdsDestructor,
+    .entryGetSize = sdsEntryGetSize};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;
@@ -714,6 +721,10 @@ size_t hashHashtableTypeMetadataSize(void) {
     return sizeof(void *);
 }
 
+size_t hashEntryGetSize(const void *entry) {
+    return entryGetLogicalSize(entry);
+}
+
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
@@ -721,6 +732,7 @@ hashtableType hashHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
@@ -729,6 +741,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
 };
@@ -3894,6 +3907,20 @@ void call(client *c, int flags) {
     long long old_primary_repl_offset = server.primary_repl_offset;
     incrCommandStatsOnError(NULL, 0);
 
+    /* Per-slot memory tracking: full before/after for writes,
+     * lightweight overhead-only check for hash/set reads (argv[1] only)
+     * since incremental rehashing can change overhead without a write. */
+    int slot_mem_enabled = clusterSlotStatsEnabled(c->slot);
+    int track_slot_write_memory = slot_mem_enabled && (c->cmd->flags & CMD_WRITE);
+    size_t slot_mem_before = 0;
+    slotMemKeys slot_mem_keys;
+    if (track_slot_write_memory) {
+        slot_mem_before = clusterSlotStatsSnapshotMemoryBefore(c, &slot_mem_keys);
+    } else if (slot_mem_enabled && c->cmd->key_specs_num > 0 && c->argc >= 2 &&
+               (c->cmd->group == COMMAND_GROUP_HASH || c->cmd->group == COMMAND_GROUP_SET)) {
+        slot_mem_before = clusterSlotStatsSnapshotRehashOverhead(c);
+    }
+
     const ustime_t call_timer = ustime();
     enterExecutionUnit(1, call_timer);
 
@@ -3912,6 +3939,19 @@ void call(client *c, int flags) {
     c->cmd->proc(c);
 
     exitExecutionUnit();
+
+    /* Apply per-slot memory deltas after the command. */
+    if (track_slot_write_memory) {
+        if (!c->flag.blocked) {
+            clusterSlotStatsApplyMemoryAfter(c, &slot_mem_keys, slot_mem_before);
+        } else {
+            /* Command blocked — free the saved key names without applying deltas.
+             * The delta will be captured when the command is reprocessed after unblocking. */
+            clusterSlotStatsFreeKeys(&slot_mem_keys);
+        }
+    } else if (slot_mem_before && !c->flag.blocked) {
+        clusterSlotStatsApplyRehashOverhead(c, slot_mem_before);
+    }
 
     /* In case client is blocked after trying to execute the command,
      * it means the execution is not yet completed and we MIGHT reprocess the command in the future. */

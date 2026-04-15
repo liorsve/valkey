@@ -12,6 +12,7 @@ typedef enum {
     CPU_USEC,
     NETWORK_BYTES_IN,
     NETWORK_BYTES_OUT,
+    MEMORY_LOGICAL_BYTES,
     SLOT_STAT_COUNT,
     INVALID
 } slotStatType;
@@ -51,6 +52,7 @@ static uint64_t getSlotStat(int slot, slotStatType stat_type) {
     case CPU_USEC: slot_stat = server.cluster->slot_stats[slot].cpu_usec; break;
     case NETWORK_BYTES_IN: slot_stat = server.cluster->slot_stats[slot].network_bytes_in; break;
     case NETWORK_BYTES_OUT: slot_stat = server.cluster->slot_stats[slot].network_bytes_out; break;
+    case MEMORY_LOGICAL_BYTES: slot_stat = server.cluster->slot_stats[slot].memory_logical_bytes; break;
     case SLOT_STAT_COUNT:
     case INVALID: serverPanic("Invalid slot stat type %d was found.", stat_type);
     }
@@ -108,6 +110,8 @@ static void addReplySlotStat(client *c, int slot) {
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_in);
         addReplyBulkCString(c, "network-bytes-out");
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_out);
+        addReplyBulkCString(c, "memory-logical-bytes");
+        addReplyLongLong(c, server.cluster->slot_stats[slot].memory_logical_bytes);
     }
 }
 
@@ -287,6 +291,8 @@ void clusterSlotStatsCommand(client *c) {
             order_by = NETWORK_BYTES_IN;
         } else if (!strcasecmp(objectGetVal(c->argv[3]), "network-bytes-out") && server.cluster_slot_stats_enabled) {
             order_by = NETWORK_BYTES_OUT;
+        } else if (!strcasecmp(objectGetVal(c->argv[3]), "memory-logical-bytes") && server.cluster_slot_stats_enabled) {
+            order_by = MEMORY_LOGICAL_BYTES;
         } else {
             addReplyError(c, "Unrecognized sort metric for ORDERBY.");
             return;
@@ -329,4 +335,107 @@ void clusterSlotStatsCommand(client *c) {
 
 int clusterSlotStatsEnabled(int slot) {
     return server.cluster_slot_stats_enabled && server.cluster_enabled && slot != -1;
+}
+
+/* --------------------------------------------------------------------------
+ * Per-slot memory tracking via before/after hooks in call().
+ *
+ * In cluster mode all keys in a command belong to the same slot (c->slot).
+ * The before-hook extracts keys via getKeysFromCommand, copies the key names,
+ * and sums their sizes. The after-hook looks up those same key names via
+ * dbFind (safe even if argv was rewritten during command execution).
+ * -------------------------------------------------------------------------- */
+
+static size_t sumKeysByName(client *c, sds *keynames, int count) {
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        total += objectLogicalSize(dbFind(c->db, keynames[i]));
+    }
+    return total;
+}
+
+/* Called from call() before c->cmd->proc(c) for write commands.
+ * Returns the total logical size of all keys before the command. */
+size_t clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk) {
+    getKeysResult result;
+    initGetKeysResult(&result);
+    getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+
+    sk->count = result.numkeys;
+    sk->keys = (result.numkeys > SLOT_MEM_KEYS_STATIC) ? zmalloc(sizeof(sds) * result.numkeys) : sk->buf;
+
+    for (int i = 0; i < result.numkeys; i++) {
+        sk->keys[i] = sdsdup(objectGetVal(c->argv[result.keys[i].pos]));
+    }
+    getKeysFreeResult(&result);
+
+    return sumKeysByName(c, sk->keys, sk->count);
+}
+
+/* Free saved key name copies without applying deltas. Called when the
+ * command blocked and the after-hook is skipped. */
+void clusterSlotStatsFreeKeys(slotMemKeys *sk) {
+    for (int i = 0; i < sk->count; i++) {
+        sdsfree(sk->keys[i]);
+    }
+    if (sk->keys != sk->buf) zfree(sk->keys);
+}
+
+/* Called from call() after c->cmd->proc(c). Looks up the saved key names
+ * (safe even after argv rewrite), computes deltas, and frees key copies. */
+void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk, size_t before) {
+    size_t after = sumKeysByName(c, sk->keys, sk->count);
+    clusterSlotStatsFreeKeys(sk);
+
+    int64_t delta = (int64_t)after - (int64_t)before;
+    if (delta != 0) server.cluster->slot_stats[c->slot].memory_logical_bytes += delta;
+}
+
+/* Lightweight pre-command check for hash/set reads: only snapshot overhead
+ * if the key is hashtable-encoded AND mid-rehash (the only case where a
+ * read can change overhead via incremental rehashing). Returns the
+ * pre-command logical size, or 0 if the after-hook can be skipped. */
+size_t clusterSlotStatsSnapshotRehashOverhead(client *c) {
+    sds keyname = objectGetVal(c->argv[1]);
+    robj *val = dbFind(c->db, keyname);
+    if (!val || val->encoding != OBJ_ENCODING_HASHTABLE) return 0;
+    if (val->type != OBJ_SET && val->type != OBJ_HASH) return 0;
+    if (!hashtableIsRehashing(objectGetVal(val))) return 0;
+
+    return objectLogicalSize(val);
+}
+
+/* Post-command check: re-read logical size for argv[1] and apply delta. */
+void clusterSlotStatsApplyRehashOverhead(client *c, size_t before) {
+    robj *val = dbFind(c->db, objectGetVal(c->argv[1]));
+    size_t after = val ? objectLogicalSize(val) : 0;
+
+    int64_t delta = (int64_t)after - (int64_t)before;
+    if (delta != 0) server.cluster->slot_stats[c->slot].memory_logical_bytes += delta;
+}
+
+/* Recount slot memory stats from scratch by walking all keys in all slots.
+ * Called after AOF loading to correct stats for RESP commands that bypassed call(). */
+void clusterSlotStatsRecountMemory(void) {
+    if (!server.cluster_enabled || !server.cluster_slot_stats_enabled) return;
+
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        server.cluster->slot_stats[slot].memory_logical_bytes = 0;
+    }
+
+    for (int j = 0; j < server.dbnum; j++) {
+        if (server.db[j] == NULL) continue;
+        for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+            hashtable *ht = kvstoreGetHashtable(server.db[j]->keys, slot);
+            if (!ht) continue;
+            hashtableIterator iter;
+            hashtableInitIterator(&iter, ht, 0);
+            void *entry;
+            while (hashtableNext(&iter, &entry)) {
+                robj *val = entry;
+                server.cluster->slot_stats[slot].memory_logical_bytes += (int64_t)objectLogicalSize(val);
+            }
+            hashtableCleanupIterator(&iter);
+        }
+    }
 }

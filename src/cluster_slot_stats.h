@@ -13,6 +13,20 @@ void clusterSlotStatsAddCpuDuration(client *c, ustime_t duration);
 /* network-bytes-in metric. */
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c);
 
+/* memory-logical-bytes metric. */
+#define SLOT_MEM_KEYS_STATIC 4
+typedef struct slotMemKeys {
+    sds buf[SLOT_MEM_KEYS_STATIC];
+    sds *keys;
+    int count;
+} slotMemKeys;
+size_t clusterSlotStatsSnapshotMemoryBefore(client *c, slotMemKeys *sk);
+void clusterSlotStatsApplyMemoryAfter(client *c, slotMemKeys *sk, size_t before);
+void clusterSlotStatsFreeKeys(slotMemKeys *sk);
+size_t clusterSlotStatsSnapshotRehashOverhead(client *c);
+void clusterSlotStatsApplyRehashOverhead(client *c, size_t before);
+void clusterSlotStatsRecountMemory(void);
+
 /* network-bytes-out metric. */
 void clusterSlotStatsAddNetworkBytesOutForSlot(int slot, unsigned long long net_bytes_out);
 void clusterSlotStatsAddNetworkBytesOutForUserClient(client *c);

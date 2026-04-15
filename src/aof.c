@@ -32,6 +32,7 @@
 #include "rio.h"
 #include "functions.h"
 #include "module.h"
+#include "cluster_slot_stats.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -1890,6 +1891,11 @@ int loadAppendOnlyFiles(aofManifest *am) {
 
 cleanup:
     stopLoading(ret == AOF_OK || ret == AOF_TRUNCATED);
+    /* AOF RESP commands bypass call(), so slot memory stats may be incomplete.
+     * Recount from scratch after loading completes. */
+    if (ret == AOF_OK || ret == AOF_TRUNCATED) {
+        clusterSlotStatsRecountMemory();
+    }
     return ret;
 }
 

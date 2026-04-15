@@ -37,6 +37,7 @@
 #include "module.h"
 #include "vector.h"
 #include "expire.h"
+#include "cluster_slot_stats.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -287,6 +288,11 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
 
     /* Track hash objects containing volatile items, created by rdbLoadObject (which lacks DB context). */
     dbTrackKeyWithVolatileItems(db, val);
+
+    /* Accumulate per-slot memory for keys loaded from RDB. */
+    if (server.cluster_slot_stats_enabled) {
+        server.cluster->slot_stats[dict_index].memory_logical_bytes += (int64_t)objectLogicalSize(val);
+    }
 
     *valref = val;
     return 1;
@@ -771,6 +777,13 @@ void signalFlushedDb(int dbid, int async) {
     }
 
     trackingInvalidateKeysOnFlush(async);
+
+    /* Reset per-slot memory counters on flush. */
+    if (server.cluster_enabled && server.cluster_slot_stats_enabled) {
+        for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+            server.cluster->slot_stats[slot].memory_logical_bytes = 0;
+        }
+    }
 
     /* Changes in this method may take place in swapMainDbWithTempDb as well,
      * where we execute similar calls, but with subtle differences as it's
@@ -1937,6 +1950,19 @@ long long getExpire(serverDb *db, robj *key) {
 }
 
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
+    /* Subtract this key's memory from slot stats before deletion.
+     * Skip during lazy expiry (triggered inside cmd->proc via lookupKeyWrite →
+     * expireIfNeeded) — the call() before/after hooks already track this key's
+     * delta. executing_command is set exactly during cmd->proc scope. Active
+     * expiry (background cron) has no current_client, so the hook fires. */
+    if (clusterSlotStatsEnabled(dict_index) &&
+        !(server.current_client && server.current_client->flag.executing_command)) {
+        robj *val = dbFind(db, objectGetVal(keyobj));
+        if (val) {
+            server.cluster->slot_stats[dict_index].memory_logical_bytes -= (int64_t)objectLogicalSize(val);
+        }
+    }
+
     mstime_t expire_latency;
     latencyStartMonitor(expire_latency);
     dbGenericDeleteWithDictIndex(db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED, dict_index);
@@ -2052,8 +2078,22 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         /* Process in batches to avoid large stack allocations. */
         unsigned long batch_size = max_entries > EXPIRE_BULK_LIMIT ? EXPIRE_BULK_LIMIT : max_entries;
         robj *entries[EXPIRE_BULK_LIMIT];
+
+        /* Snapshot memory before field deletion for slot stats delta. */
+        size_t mem_before = 0;
+        if (clusterSlotStatsEnabled(didx)) {
+            mem_before = objectLogicalSize(o);
+        }
+
         size_t expired = hashTypeDeleteExpiredFields(o, now, batch_size, entries);
         if (expired == 0) break;
+
+        /* Update slot stats with the delta from expired fields. */
+        if (clusterSlotStatsEnabled(didx)) {
+            size_t mem_after = objectLogicalSize(o);
+            int64_t delta = (int64_t)mem_after - (int64_t)mem_before;
+            if (delta != 0) server.cluster->slot_stats[didx].memory_logical_bytes += delta;
+        }
 
         /* Clean up volatile set if no more volatile fields remain */
         if (!hashTypeHasVolatileFields(o)) {
@@ -2070,6 +2110,10 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         propagateFieldsDeletion(db, o, expired, entries, didx);
         notifyKeyspaceEvent(NOTIFY_EXPIRED, "hexpired", keyobj, db->id);
         if (deleteKey) {
+            /* Key is empty — subtract remaining overhead from slot stats. */
+            if (clusterSlotStatsEnabled(didx)) {
+                server.cluster->slot_stats[didx].memory_logical_bytes -= (int64_t)objectLogicalSize(o);
+            }
             dbDelete(db, keyobj);
             propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
