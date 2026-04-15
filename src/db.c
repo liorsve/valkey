@@ -291,10 +291,7 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
 
     /* Accumulate per-slot memory for keys loaded from RDB. */
     if (server.cluster_slot_stats_enabled) {
-        size_t data_bytes, overhead_bytes;
-        objectLogicalSize(val, &data_bytes, &overhead_bytes);
-        server.cluster->slot_stats[dict_index].data_bytes += (int64_t)data_bytes;
-        server.cluster->slot_stats[dict_index].overhead_bytes += (int64_t)overhead_bytes;
+        server.cluster->slot_stats[dict_index].memory_logical_bytes += (int64_t)objectLogicalSize(val);
     }
 
     *valref = val;
@@ -784,8 +781,7 @@ void signalFlushedDb(int dbid, int async) {
     /* Reset per-slot memory counters on flush. */
     if (server.cluster_enabled && server.cluster_slot_stats_enabled) {
         for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
-            server.cluster->slot_stats[slot].data_bytes = 0;
-            server.cluster->slot_stats[slot].overhead_bytes = 0;
+            server.cluster->slot_stats[slot].memory_logical_bytes = 0;
         }
     }
 
@@ -1963,10 +1959,7 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
         !(server.current_client && server.current_client->flag.executing_command)) {
         robj *val = dbFind(db, objectGetVal(keyobj));
         if (val) {
-            size_t d, o;
-            objectLogicalSize(val, &d, &o);
-            server.cluster->slot_stats[dict_index].data_bytes -= (int64_t)d;
-            server.cluster->slot_stats[dict_index].overhead_bytes -= (int64_t)o;
+            server.cluster->slot_stats[dict_index].memory_logical_bytes -= (int64_t)objectLogicalSize(val);
         }
     }
 
@@ -2087,9 +2080,9 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         robj *entries[EXPIRE_BULK_LIMIT];
 
         /* Snapshot memory before field deletion for slot stats delta. */
-        size_t mem_before_d = 0, mem_before_o = 0;
+        size_t mem_before = 0;
         if (clusterSlotStatsEnabled(didx)) {
-            objectLogicalSize(o, &mem_before_d, &mem_before_o);
+            mem_before = objectLogicalSize(o);
         }
 
         size_t expired = hashTypeDeleteExpiredFields(o, now, batch_size, entries);
@@ -2097,10 +2090,9 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
 
         /* Update slot stats with the delta from expired fields. */
         if (clusterSlotStatsEnabled(didx)) {
-            size_t mem_after_d = 0, mem_after_o = 0;
-            objectLogicalSize(o, &mem_after_d, &mem_after_o);
-            server.cluster->slot_stats[didx].data_bytes -= (int64_t)(mem_before_d - mem_after_d);
-            server.cluster->slot_stats[didx].overhead_bytes -= (int64_t)(mem_before_o - mem_after_o);
+            size_t mem_after = objectLogicalSize(o);
+            int64_t delta = (int64_t)mem_after - (int64_t)mem_before;
+            if (delta != 0) server.cluster->slot_stats[didx].memory_logical_bytes += delta;
         }
 
         /* Clean up volatile set if no more volatile fields remain */
@@ -2120,10 +2112,7 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         if (deleteKey) {
             /* Key is empty — subtract remaining overhead from slot stats. */
             if (clusterSlotStatsEnabled(didx)) {
-                size_t d, oh;
-                objectLogicalSize(o, &d, &oh);
-                server.cluster->slot_stats[didx].data_bytes -= (int64_t)d;
-                server.cluster->slot_stats[didx].overhead_bytes -= (int64_t)oh;
+                server.cluster->slot_stats[didx].memory_logical_bytes -= (int64_t)objectLogicalSize(o);
             }
             dbDelete(db, keyobj);
             propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);

@@ -403,15 +403,15 @@ void mallctl_string(client *c, robj **argv, int argc) {
 /* Testing only: independent O(n) walk to compute expected per-slot memory.
  * Does NOT use objectLogicalSize, tracked_data_bytes, or any tracking field
  * — only pre-existing APIs. Used by DEBUG SLOT-VERIFY-MEMORY to verify
- * that slot stats match reality. */
-static void computeObjectExpectedSize(robj *o, size_t *data, size_t *overhead) {
-    *data = 0;
-    *overhead = 0;
+ * that slot stats match reality. Returns sum of data + overhead. */
+static size_t computeObjectExpectedSize(robj *o) {
+    size_t data = 0;
+    size_t overhead = 0;
 
     if (o->type == OBJ_STRING) {
         if (o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR) {
             sds s = objectGetVal(o);
-            *data = sdsReqSize(sdslen(s), sdsType(s));
+            data = sdsReqSize(sdslen(s), sdsType(s));
         }
     } else if (o->type == OBJ_LIST) {
         if (o->encoding == OBJ_ENCODING_QUICKLIST) {
@@ -427,10 +427,10 @@ static void computeObjectExpectedSize(robj *o, size_t *data, size_t *overhead) {
                 }
                 node = node->next;
             }
-            *data = d;
-            *overhead = sizeof(quicklist) + ql->len * sizeof(quicklistNode);
+            data = d;
+            overhead = sizeof(quicklist) + ql->len * sizeof(quicklistNode);
         } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            *data = lpBytes(objectGetVal(o));
+            data = lpBytes(objectGetVal(o));
         }
     } else if (o->type == OBJ_SET) {
         if (o->encoding == OBJ_ENCODING_HASHTABLE) {
@@ -444,12 +444,12 @@ static void computeObjectExpectedSize(robj *o, size_t *data, size_t *overhead) {
                 d += sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
             }
             hashtableCleanupIterator(&iter);
-            *data = d;
-            *overhead = hashtableMemUsage(ht);
+            data = d;
+            overhead = hashtableMemUsage(ht);
         } else if (o->encoding == OBJ_ENCODING_INTSET) {
-            *data = intsetBlobLen(objectGetVal(o));
+            data = intsetBlobLen(objectGetVal(o));
         } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            *data = lpBytes(objectGetVal(o));
+            data = lpBytes(objectGetVal(o));
         }
     } else if (o->type == OBJ_HASH) {
         if (o->encoding == OBJ_ENCODING_HASHTABLE) {
@@ -479,18 +479,18 @@ static void computeObjectExpectedSize(robj *o, size_t *data, size_t *overhead) {
                 }
             }
             hashtableCleanupIterator(&iter);
-            *data = d;
-            *overhead = hashtableMemUsage(ht);
+            data = d;
+            overhead = hashtableMemUsage(ht);
             vset *volatile_fields = hashtableMetadata(ht);
             if (vsetIsValid(volatile_fields)) {
-                *overhead += vsetComputeLogicalSize(volatile_fields);
+                overhead += vsetComputeLogicalSize(volatile_fields);
             }
         } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            *data = lpBytes(objectGetVal(o));
+            data = lpBytes(objectGetVal(o));
         }
     } else if (o->type == OBJ_ZSET) {
         if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            *data = lpBytes(objectGetVal(o));
+            data = lpBytes(objectGetVal(o));
         }
         /* Skiplist: no O(1) tracking, stays 0 */
     } else if (o->type == OBJ_STREAM) {
@@ -529,9 +529,10 @@ static void computeObjectExpectedSize(robj *o, size_t *data, size_t *overhead) {
             }
             raxStop(&ri);
         }
-        *data = d;
-        *overhead = oh;
+        data = d;
+        overhead = oh;
     }
+    return data + overhead;
 }
 
 void debugCommand(client *c) {
@@ -1059,7 +1060,7 @@ void debugCommand(client *c) {
                 addReplyError(c, "Invalid slot number");
             } else {
                 /* Walk all keys in this slot and compute expected sizes independently. */
-                size_t exp_data = 0, exp_overhead = 0;
+                size_t expected = 0;
                 hashtable *ht = kvstoreGetHashtable(c->db->keys, slot);
                 if (ht) {
                     hashtableIterator iter;
@@ -1067,26 +1068,20 @@ void debugCommand(client *c) {
                     void *entry;
                     while (hashtableNext(&iter, &entry)) {
                         robj *val = entry;
-                        size_t d, o;
-                        computeObjectExpectedSize(val, &d, &o);
-                        exp_data += d;
-                        exp_overhead += o;
+                        expected += computeObjectExpectedSize(val);
                     }
                     hashtableCleanupIterator(&iter);
                 }
 
-                int64_t actual_data = server.cluster->slot_stats[slot].data_bytes;
-                int64_t actual_overhead = server.cluster->slot_stats[slot].overhead_bytes;
+                int64_t actual = server.cluster->slot_stats[slot].memory_logical_bytes;
 
-                if (actual_data == (int64_t)exp_data && actual_overhead == (int64_t)exp_overhead) {
+                if (actual == (int64_t)expected) {
                     addReply(c, shared.ok);
                 } else {
                     addReplyErrorFormat(c,
                                         "Slot %d memory mismatch: "
-                                        "data_bytes actual=%lld expected=%zu, "
-                                        "overhead_bytes actual=%lld expected=%zu",
-                                        slot, (long long)actual_data, exp_data,
-                                        (long long)actual_overhead, exp_overhead);
+                                        "memory_logical_bytes actual=%lld expected=%zu",
+                                        slot, (long long)actual, expected);
                 }
             }
         }

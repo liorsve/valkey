@@ -562,10 +562,7 @@ int performEvictions(void) {
             if (clusterSlotStatsEnabled(bestslot)) {
                 robj *val = dbFind(db, bestkey);
                 if (val) {
-                    size_t d, o;
-                    objectLogicalSize(val, &d, &o);
-                    server.cluster->slot_stats[bestslot].data_bytes -= (int64_t)d;
-                    server.cluster->slot_stats[bestslot].overhead_bytes -= (int64_t)o;
+                    server.cluster->slot_stats[bestslot].memory_logical_bytes -= (int64_t)objectLogicalSize(val);
                 }
             }
 

@@ -1052,20 +1052,18 @@ start_cluster 1 0 {tags {external:skip cluster} overrides {cluster-slot-stats-en
 }
 
 # -----------------------------------------------------------------------------
-# Test cases for CLUSTER SLOT-STATS memory-data-bytes / memory-overhead-bytes.
+# Test cases for CLUSTER SLOT-STATS memory-logical-bytes.
 # Uses DEBUG SLOT-VERIFY-MEMORY to independently walk all keys in a slot and
 # verify that slot_stats match. The walk does NOT use objectLogicalSize or any
 # tracking field — only pre-existing APIs.
 # -----------------------------------------------------------------------------
 
-# Helper: get memory-data-bytes and memory-overhead-bytes for a given slot.
+# Helper: get memory-logical-bytes for a given slot.
 proc get_slot_memory {slot} {
     set slot_stats [R 0 CLUSTER SLOT-STATS SLOTSRANGE $slot $slot]
     set slot_stats [convert_array_into_dict $slot_stats]
     set stats [dict get $slot_stats $slot]
-    set data [dict get $stats memory-data-bytes]
-    set overhead [dict get $stats memory-overhead-bytes]
-    return [list $data $overhead]
+    return [dict get $stats memory-logical-bytes]
 }
 
 # Helper: assert slot memory matches independent walk via DEBUG command.
@@ -1084,51 +1082,48 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
     set key2_slot [R 0 cluster keyslot $key2]
 
     test "SLOT-STATS memory, initially zero." {
-        lassign [get_slot_memory $key_slot] data overhead
-        assert_equal $data 0
-        assert_equal $overhead 0
+        set mem [get_slot_memory $key_slot]
+        assert_equal $mem 0
     }
 
     test "SLOT-STATS memory, string SET and verify." {
         R 0 SET $key "hello world"
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data overhead
-        assert {$data > 0}
-        assert_equal $overhead 0
+        set mem [get_slot_memory $key_slot]
+        assert {$mem > 0}
     }
     R 0 FLUSHALL
 
     test "SLOT-STATS memory, string overwrite changes size." {
         R 0 SET $key "small"
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_small _
+        set mem_small [get_slot_memory $key_slot]
 
         R 0 SET $key [string repeat "x" 1000]
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_large _
-        assert {$data_large > $data_small}
+        set mem_large [get_slot_memory $key_slot]
+        assert {$mem_large > $mem_small}
     }
     R 0 FLUSHALL
 
     test "SLOT-STATS memory, integer string has zero data." {
         R 0 SET $key 42
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data overhead
-        assert_equal $data 0
-        assert_equal $overhead 0
+        set mem [get_slot_memory $key_slot]
+        assert_equal $mem 0
     }
     R 0 FLUSHALL
 
     test "SLOT-STATS memory, DEL removes all memory." {
         R 0 SET $key [string repeat "x" 500]
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before _
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         R 0 DEL $key
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_after _
-        assert_equal $data_after 0
+        set mem_after [get_slot_memory $key_slot]
+        assert_equal $mem_after 0
     }
     R 0 FLUSHALL
 
@@ -1137,12 +1132,12 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         set tag_key2 "{$key}:b"
         R 0 SET $tag_key1 "aaa"
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data1 _
+        set mem1 [get_slot_memory $key_slot]
 
         R 0 SET $tag_key2 "bbbbb"
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data2 _
-        assert {$data2 > $data1}
+        set mem2 [get_slot_memory $key_slot]
+        assert {$mem2 > $mem1}
     }
     R 0 FLUSHALL
 
@@ -1155,10 +1150,10 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 DEL $key
         verify_slot_memory $key_slot
         verify_slot_memory $key2_slot
-        lassign [get_slot_memory $key_slot] data1 _
-        lassign [get_slot_memory $key2_slot] data2 _
-        assert_equal $data1 0
-        assert {$data2 > 0}
+        set mem1 [get_slot_memory $key_slot]
+        set mem2 [get_slot_memory $key2_slot]
+        assert_equal $mem1 0
+        assert {$mem2 > 0}
     }
     R 0 FLUSHALL
 
@@ -1166,10 +1161,10 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 SET $key "value1"
         R 0 SET $key2 "value2"
         R 0 FLUSHALL
-        lassign [get_slot_memory $key_slot] data1 _
-        lassign [get_slot_memory $key2_slot] data2 _
-        assert_equal $data1 0
-        assert_equal $data2 0
+        set mem1 [get_slot_memory $key_slot]
+        set mem2 [get_slot_memory $key2_slot]
+        assert_equal $mem1 0
+        assert_equal $mem2 0
     }
 
     test "SLOT-STATS memory, hash in-place growth." {
@@ -1179,9 +1174,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
             R 0 HSET $key "field_$i" "value_$i"
             verify_slot_memory $key_slot
         }
-        lassign [get_slot_memory $key_slot] data overhead
-        assert {$data > 0}
-        assert {$overhead > 0} ;# hashtable encoding has bucket overhead
+        set mem [get_slot_memory $key_slot]
+        assert {$mem > 0}
         R 0 CONFIG SET hash-max-listpack-entries 128
     }
     R 0 FLUSHALL
@@ -1191,14 +1185,14 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
             R 0 SADD $key "member_$i"
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_full _
+        set mem_full [get_slot_memory $key_slot]
 
         for {set i 0} {$i < 100} {incr i} {
             R 0 SREM $key "member_$i"
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_half _
-        assert {$data_half < $data_full}
+        set mem_half [get_slot_memory $key_slot]
+        assert {$mem_half < $mem_full}
     }
     R 0 FLUSHALL
 
@@ -1207,14 +1201,14 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
             R 0 RPUSH $key "item_$i"
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_full overhead_full
+        set mem_full [get_slot_memory $key_slot]
 
         for {set i 0} {$i < 50} {incr i} {
             R 0 LPOP $key
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_half _
-        assert {$data_half < $data_full}
+        set mem_half [get_slot_memory $key_slot]
+        assert {$mem_half < $mem_full}
     }
     R 0 FLUSHALL
 
@@ -1227,13 +1221,13 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
             R 0 XADD $key "*" field_$i value_$i
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before _
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         R 0 XTRIM $key MAXLEN 5
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_after _
-        assert {$data_after < $data_before}
+        set mem_after [get_slot_memory $key_slot]
+        assert {$mem_after < $mem_before}
         R 0 CONFIG SET stream-node-max-entries 100
     }
     R 0 FLUSHALL
@@ -1295,20 +1289,19 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         $r EXEC
 
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data overhead
-        assert {$data > 0}
-        assert {$overhead > 0}
+        set mem [get_slot_memory $key_slot]
+        assert {$mem > 0}
 
         R 0 CONFIG SET hash-max-listpack-entries 128
         R 0 CONFIG SET set-max-listpack-entries 128
     }
     R 0 FLUSHALL
 
-    test "SLOT-STATS memory, ORDERBY memory-data-bytes." {
+    test "SLOT-STATS memory, ORDERBY memory-logical-bytes." {
         R 0 SET $key "small"
         R 0 SET $key2 [string repeat "x" 500]
-        set slot_stats [R 0 CLUSTER SLOT-STATS ORDERBY memory-data-bytes LIMIT 2 DESC]
-        assert_slot_stats_monotonic_descent $slot_stats memory-data-bytes
+        set slot_stats [R 0 CLUSTER SLOT-STATS ORDERBY memory-logical-bytes LIMIT 2 DESC]
+        assert_slot_stats_monotonic_descent $slot_stats memory-logical-bytes
     }
     R 0 FLUSHALL
 
@@ -1327,8 +1320,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         # the old size is subtracted twice.
         R 0 SET $key [string repeat "b" 300]
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data _
-        assert {$data > 0}
+        set mem [get_slot_memory $key_slot]
+        assert {$mem > 0}
 
         R 0 DEBUG SET-ACTIVE-EXPIRE 1
     }
@@ -1338,8 +1331,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         # Set a key with 1 second TTL.
         R 0 SET $key [string repeat "x" 200] PX 500
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before _
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         # Wait for the key to expire.
         after 1000
@@ -1347,8 +1340,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 GET $key
 
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_after _
-        assert_equal $data_after 0
+        set mem_after [get_slot_memory $key_slot]
+        assert_equal $mem_after 0
     }
     R 0 FLUSHALL
 
@@ -1357,27 +1350,27 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         # Add fields until resize triggers, then verify after each.
         for {set i 0} {$i < 100} {incr i} {
             R 0 HSET $key "field_$i" [string repeat "v" 20]
-            lassign [get_slot_memory $key_slot] d o
+            set mem [get_slot_memory $key_slot]
             if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
-                puts "FAIL at HSET field_$i: data=$d overhead=$o err=$err"
+                puts "FAIL at HSET field_$i: mem=$mem err=$err"
                 fail "hash rehash repro: $err"
             }
         }
         # Now delete fields one by one and verify.
         for {set i 0} {$i < 50} {incr i} {
             R 0 HDEL $key "field_$i"
-            lassign [get_slot_memory $key_slot] d o
+            set mem [get_slot_memory $key_slot]
             if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
-                puts "FAIL at HDEL field_$i: data=$d overhead=$o err=$err"
+                puts "FAIL at HDEL field_$i: mem=$mem err=$err"
                 fail "hash rehash repro: $err"
             }
         }
         # Add more to trigger another resize cycle.
         for {set i 100} {$i < 200} {incr i} {
             R 0 HSET $key "field_$i" [string repeat "w" 20]
-            lassign [get_slot_memory $key_slot] d o
+            set mem [get_slot_memory $key_slot]
             if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
-                puts "FAIL at HSET field_$i (2nd wave): data=$d overhead=$o err=$err"
+                puts "FAIL at HSET field_$i (2nd wave): mem=$mem err=$err"
                 fail "hash rehash repro: $err"
             }
         }
@@ -1413,8 +1406,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
                 }
 
                 if {[catch {R 0 DEBUG SLOT-VERIFY-MEMORY $key_slot} err]} {
-                    lassign [get_slot_memory $key_slot] d o
-                    puts "FAIL round=$round iter=$i op=$op data=$d overhead=$o err=$err"
+                    set mem [get_slot_memory $key_slot]
+                    puts "FAIL round=$round iter=$i op=$op mem=$mem err=$err"
                     fail "hash+set rehash repro: $err"
                 }
             }
@@ -1499,8 +1492,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
             R 0 SET "{$key}:evict_$i" [string repeat "x" 500]
         }
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before _
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         # Set maxmemory to trigger eviction of some keys.
         set used [s 0 used_memory]
@@ -1526,8 +1519,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 HSET $key persistent1 value1 persistent2 value2
 
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before overhead_before
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         # Wait for fields to expire.
         after 2000
@@ -1539,8 +1532,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         # The hash should still exist (persistent fields remain) but be smaller.
         assert {[R 0 HLEN $key] == 2}
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_after _
-        assert {$data_after < $data_before}
+        set mem_after [get_slot_memory $key_slot]
+        assert {$mem_after < $mem_before}
 
         R 0 CONFIG SET hash-max-listpack-entries 128
     }
@@ -1552,8 +1545,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 HSETEX $key EX 1 FIELDS 3 f1 v1 f2 v2 f3 v3
 
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before _
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         # Wait for all fields to expire.
         after 2000
@@ -1562,8 +1555,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         # Key should be gone.
         assert {[R 0 EXISTS $key] == 0}
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_after _
-        assert_equal $data_after 0
+        set mem_after [get_slot_memory $key_slot]
+        assert_equal $mem_after 0
         R 0 CONFIG SET hash-max-listpack-entries 128
     }
     R 0 FLUSHALL
@@ -1581,8 +1574,8 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
         R 0 CONFIG SET hash-max-listpack-entries 128
 
         verify_slot_memory $key_slot
-        lassign [get_slot_memory $key_slot] data_before overhead_before
-        assert {$data_before > 0}
+        set mem_before [get_slot_memory $key_slot]
+        assert {$mem_before > 0}
 
         # Reload from RDB — slot stats are rebuilt via dbAddRDBLoad hook.
         R 0 DEBUG RELOAD
@@ -1620,10 +1613,10 @@ start_cluster 1 0 {tags {external:skip cluster needs:debug} overrides {cluster-s
 
         verify_slot_memory $key_slot
         verify_slot_memory $key2_slot
-        lassign [get_slot_memory $key_slot] data1 _
-        lassign [get_slot_memory $key2_slot] data2 _
-        assert {$data1 > 0}
-        assert {$data2 > 0}
+        set mem1 [get_slot_memory $key_slot]
+        set mem2 [get_slot_memory $key2_slot]
+        assert {$mem1 > 0}
+        assert {$mem2 > 0}
 
         R 0 CONFIG SET appendonly no
     }
