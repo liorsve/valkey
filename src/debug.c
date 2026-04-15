@@ -39,6 +39,11 @@
 #include "io_threads.h"
 #include "sds.h"
 #include "module.h"
+#include "stream.h"
+#include "entry.h"
+#include "vset.h"
+#include "intset.h"
+#include "cluster_legacy.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -394,6 +399,131 @@ void mallctl_string(client *c, robj **argv, int argc) {
         addReply(c, shared.ok);
 }
 #endif
+
+/* Independent walk to compute expected per-slot memory. Does NOT use
+ * objectLogicalSize, tracked_data_bytes, or any tracking field — only
+ * pre-existing APIs. Used by DEBUG SLOT-VERIFY-MEMORY. */
+static size_t computeObjectExpectedSize(robj *o) {
+    size_t total = 0;
+
+    if (o->type == OBJ_STRING) {
+        if (o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR) {
+            sds s = objectGetVal(o);
+            total += sdsReqSize(sdslen(s), sdsType(s));
+        }
+    } else if (o->type == OBJ_LIST) {
+        if (o->encoding == OBJ_ENCODING_QUICKLIST) {
+            quicklist *ql = objectGetVal(o);
+            quicklistNode *node = ql->head;
+            while (node) {
+                if (quicklistNodeIsCompressed(node)) {
+                    quicklistLZF *lzf = (quicklistLZF *)node->entry;
+                    total += sizeof(quicklistLZF) + lzf->sz;
+                } else {
+                    total += node->sz;
+                }
+                node = node->next;
+            }
+            total += sizeof(quicklist) + ql->len * sizeof(quicklistNode);
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_SET) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            hashtableIterator iter;
+            hashtableInitIterator(&iter, ht, 0);
+            void *entry;
+            while (hashtableNext(&iter, &entry)) {
+                sds s = entry;
+                total += sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+            }
+            hashtableCleanupIterator(&iter);
+            total += hashtableMemUsage(ht);
+        } else if (o->encoding == OBJ_ENCODING_INTSET) {
+            total += intsetBlobLen(objectGetVal(o));
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_HASH) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            hashtableIterator iter;
+            hashtableInitIterator(&iter, ht, HASHTABLE_ITER_SKIP_VALIDATION);
+            void *e;
+            while (hashtableNext(&iter, &e)) {
+                /* Walk each entry's field + value independently. */
+                sds field = entryGetField(e);
+                total += sdsHdrSize(sdsType(field)) + sdslen(field) + 1;
+                if (entryHasExpiry(e)) total += sizeof(mstime_t);
+                if (entryHasEmbeddedValue(e)) {
+                    size_t vlen;
+                    char *val = entryGetValue(e, &vlen);
+                    total += sdsHdrSize(sdsType((sds)val)) + vlen + 1;
+                } else {
+                    total += sizeof(void *);
+                    if (entryHasStringRef(e)) {
+                        total += sizeof(stringRef);
+                    } else {
+                        size_t vlen;
+                        char *val = entryGetValue(e, &vlen);
+                        total += sdsHdrSize(sdsType((sds)val)) + vlen + 1;
+                    }
+                }
+            }
+            hashtableCleanupIterator(&iter);
+            total += hashtableMemUsage(ht);
+            vset *volatile_fields = hashtableMetadata(ht);
+            if (vsetIsValid(volatile_fields)) {
+                total += vsetComputeLogicalSize(volatile_fields);
+            }
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_ZSET) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+        /* Skiplist: no O(1) tracking, stays 0 */
+    } else if (o->type == OBJ_STREAM) {
+        stream *s = objectGetVal(o);
+        total += sizeof(stream);
+
+        /* Walk entry listpacks */
+        raxIterator ri;
+        raxStart(&ri, s->rax);
+        raxSeek(&ri, "^", NULL, 0);
+        while (raxNext(&ri)) total += lpBytes(ri.data);
+        raxStop(&ri);
+        total += raxComputeLogicalSize(s->rax);
+
+        /* Consumer groups */
+        if (s->cgroups) {
+            total += raxComputeLogicalSize(s->cgroups);
+            raxStart(&ri, s->cgroups);
+            raxSeek(&ri, "^", NULL, 0);
+            while (raxNext(&ri)) {
+                streamCG *cg = ri.data;
+                total += sizeof(streamCG);
+                total += raxSize(cg->pel) * sizeof(streamNACK);
+                total += raxComputeLogicalSize(cg->pel);
+                total += raxComputeLogicalSize(cg->consumers);
+                raxIterator ci;
+                raxStart(&ci, cg->consumers);
+                raxSeek(&ci, "^", NULL, 0);
+                while (raxNext(&ci)) {
+                    streamConsumer *sc = ci.data;
+                    total += sizeof(streamConsumer);
+                    total += sdsReqSize(sdslen(sc->name), sdsType(sc->name));
+                    total += raxComputeLogicalSize(sc->pel);
+                }
+                raxStop(&ci);
+            }
+            raxStop(&ri);
+        }
+    }
+    return total;
+}
 
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
@@ -898,6 +1028,52 @@ void debugCommand(client *c) {
             addReplyError(c, "argument must be a memory value bigger than 1 and smaller than 4gb");
         } else {
             addReply(c, shared.ok);
+        }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "stream-verify-tracking") && c->argc == 3) {
+        robj *o = lookupKeyRead(c->db, c->argv[2]);
+        if (o == NULL || o->type != OBJ_STREAM) {
+            addReplyError(c, "No such stream key");
+        } else {
+            char errmsg[256];
+            if (streamVerifyTracking(objectGetVal(o), errmsg, sizeof(errmsg))) {
+                addReply(c, shared.ok);
+            } else {
+                addReplyError(c, errmsg);
+            }
+        }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "slot-verify-memory") && c->argc == 3) {
+        if (!server.cluster_enabled) {
+            addReplyError(c, "Cluster mode not enabled");
+        } else {
+            int slot = atoi(objectGetVal(c->argv[2]));
+            if (slot < 0 || slot >= CLUSTER_SLOTS) {
+                addReplyError(c, "Invalid slot number");
+            } else {
+                /* Walk all keys in this slot and compute expected sizes independently. */
+                size_t expected = 0;
+                hashtable *ht = kvstoreGetHashtable(c->db->keys, slot);
+                if (ht) {
+                    hashtableIterator iter;
+                    hashtableInitIterator(&iter, ht, 0);
+                    void *entry;
+                    while (hashtableNext(&iter, &entry)) {
+                        robj *val = entry;
+                        expected += computeObjectExpectedSize(val);
+                    }
+                    hashtableCleanupIterator(&iter);
+                }
+
+                int64_t actual = server.cluster->slot_stats[slot].memory_logical_bytes;
+
+                if (actual == (int64_t)expected) {
+                    addReply(c, shared.ok);
+                } else {
+                    addReplyErrorFormat(c,
+                                        "Slot %d memory mismatch: "
+                                        "memory_logical_bytes actual=%lld expected=%zu",
+                                        slot, (long long)actual, expected);
+                }
+            }
         }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-skip-checksum-validation") && c->argc == 3) {
         server.skip_checksum_validation = atoi(objectGetVal(c->argv[2]));

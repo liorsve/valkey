@@ -12,6 +12,7 @@ typedef enum {
     CPU_USEC,
     NETWORK_BYTES_IN,
     NETWORK_BYTES_OUT,
+    MEMORY_LOGICAL_BYTES,
     SLOT_STAT_COUNT,
     INVALID
 } slotStatType;
@@ -51,6 +52,7 @@ static uint64_t getSlotStat(int slot, slotStatType stat_type) {
     case CPU_USEC: slot_stat = server.cluster->slot_stats[slot].cpu_usec; break;
     case NETWORK_BYTES_IN: slot_stat = server.cluster->slot_stats[slot].network_bytes_in; break;
     case NETWORK_BYTES_OUT: slot_stat = server.cluster->slot_stats[slot].network_bytes_out; break;
+    case MEMORY_LOGICAL_BYTES: slot_stat = server.cluster->slot_stats[slot].memory_logical_bytes; break;
     case SLOT_STAT_COUNT:
     case INVALID: serverPanic("Invalid slot stat type %d was found.", stat_type);
     }
@@ -108,6 +110,8 @@ static void addReplySlotStat(client *c, int slot) {
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_in);
         addReplyBulkCString(c, "network-bytes-out");
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_out);
+        addReplyBulkCString(c, "memory-logical-bytes");
+        addReplyLongLong(c, server.cluster->slot_stats[slot].memory_logical_bytes);
     }
 }
 
@@ -287,6 +291,8 @@ void clusterSlotStatsCommand(client *c) {
             order_by = NETWORK_BYTES_IN;
         } else if (!strcasecmp(objectGetVal(c->argv[3]), "network-bytes-out") && server.cluster_slot_stats_enabled) {
             order_by = NETWORK_BYTES_OUT;
+        } else if (!strcasecmp(objectGetVal(c->argv[3]), "memory-logical-bytes") && server.cluster_slot_stats_enabled) {
+            order_by = MEMORY_LOGICAL_BYTES;
         } else {
             addReplyError(c, "Unrecognized sort metric for ORDERBY.");
             return;
@@ -329,4 +335,157 @@ void clusterSlotStatsCommand(client *c) {
 
 int clusterSlotStatsEnabled(int slot) {
     return server.cluster_slot_stats_enabled && server.cluster_enabled && slot != -1;
+}
+
+/* --------------------------------------------------------------------------
+ * Per-slot memory tracking via per-key size cache + signalModifiedKey.
+ *
+ * Each key has a cached logical_bytes in a single hashtable
+ * (db->key_mem_cache). signalModifiedKey is the single hook: it computes
+ * the current objectLogicalSize, diffs against the cached value, updates
+ * slot_stats, and refreshes the cache. For deleted keys, current=0 and the
+ * cache provides the old size. For new keys, cache=0 and current provides
+ * the new size.
+ * -------------------------------------------------------------------------- */
+
+/* Cache entry stored in db->key_mem_cache. */
+typedef struct keySizeCacheEntry {
+    sds key;
+    size_t logical_bytes;
+} keySizeCacheEntry;
+
+static const void *keySizeCacheGetKey(const void *entry) {
+    return ((const keySizeCacheEntry *)entry)->key;
+}
+
+static void keySizeCacheEntryDestructor(void *entry) {
+    keySizeCacheEntry *e = entry;
+    sdsfree(e->key);
+    zfree(e);
+}
+
+hashtableType keySizeCacheHashtableType = {
+    .entryGetKey = keySizeCacheGetKey,
+    .hashFunction = sdsHashConfigurableSeed,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = keySizeCacheEntryDestructor,
+};
+
+/* Called from signalModifiedKey after every key mutation.
+ * Computes current size, diffs against cache, updates slot stats and cache. */
+void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key) {
+    if (!db->key_mem_cache) return;
+    sds keyname = objectGetVal(key);
+    int slot = getKVStoreIndexForKey(keyname);
+    if (!clusterSlotStatsEnabled(slot)) return;
+
+    /* Look up current value (NULL if key was just deleted). */
+    robj *val = dbFind(db, keyname);
+    size_t cur_logical = objectLogicalSize(val);
+
+    /* Look up cached size. */
+    size_t old_logical = 0;
+    void *existing = NULL;
+    int found = hashtableFind(db->key_mem_cache, keyname, &existing);
+    if (found) {
+        keySizeCacheEntry *cached = existing;
+        old_logical = cached->logical_bytes;
+    }
+
+    /* Apply delta to slot stats. */
+    int64_t delta = (int64_t)cur_logical - (int64_t)old_logical;
+    if (delta != 0) server.cluster->slot_stats[slot].memory_logical_bytes += delta;
+
+    /* Update or remove cache entry. */
+    if (val) {
+        if (found) {
+            keySizeCacheEntry *cached = existing;
+            cached->logical_bytes = cur_logical;
+        } else {
+            keySizeCacheEntry *e = zmalloc(sizeof(keySizeCacheEntry));
+            e->key = sdsdup(keyname);
+            e->logical_bytes = cur_logical;
+            hashtableAdd(db->key_mem_cache, e);
+        }
+    } else {
+        /* Key was deleted — remove cache entry. */
+        if (found) {
+            hashtableDelete(db->key_mem_cache, keyname);
+        }
+    }
+}
+
+/* Called from call() after read commands on hashtable-encoded values.
+ * Detects overhead changes from incremental rehashing during reads.
+ * Compares current objectLogicalSize against the cached logical_bytes —
+ * only refreshes the cache when they differ. O(1) per call. */
+void clusterSlotStatsHandleRehashOverhead(client *c) {
+    if (!c->db->key_mem_cache) return;
+
+    sds keyname = objectGetVal(c->argv[1]);
+    int slot = keyHashSlot(keyname, (int)sdslen(keyname));
+    void *found = NULL;
+    if (!kvstoreHashtableFind(c->db->keys, slot, keyname, &found)) return;
+    robj *val = found;
+
+    /* Only hashtable-encoded values have rehashing overhead drift. */
+    if (!val) return;
+    if (val->encoding != OBJ_ENCODING_HASHTABLE) return;
+    if (val->type != OBJ_SET && val->type != OBJ_HASH) return;
+
+    size_t current = objectLogicalSize(val);
+    void *cache_entry = NULL;
+    if (!hashtableFind(c->db->key_mem_cache, keyname, &cache_entry)) return;
+    keySizeCacheEntry *cached = cache_entry;
+    if (cached->logical_bytes == current) return;
+
+    /* Logical size changed — update slot stats and cache. */
+    int64_t delta = (int64_t)current - (int64_t)cached->logical_bytes;
+    server.cluster->slot_stats[slot].memory_logical_bytes += delta;
+    cached->logical_bytes = current;
+}
+
+/* Active-defrag callback for key_mem_cache entries.
+ * Called via hashtableScanDefrag with HASHTABLE_SCAN_EMIT_REF. */
+void clusterSlotStatsDefragKeySizeCache(void *privdata, void *entry_ref) {
+    UNUSED(privdata);
+    keySizeCacheEntry **ref = (keySizeCacheEntry **)entry_ref;
+    keySizeCacheEntry *entry = *ref;
+
+    /* Try to defrag the entry struct itself. */
+    keySizeCacheEntry *newentry = activeDefragAlloc(entry);
+    if (newentry) {
+        entry = newentry;
+        *ref = newentry;
+    }
+
+    /* Try to defrag the sds key. */
+    sds newsds = activeDefragSds(entry->key);
+    if (newsds) entry->key = newsds;
+}
+
+/* Called from signalFlushedDb to reset memory counters on FLUSHALL/FLUSHDB. */
+void clusterSlotStatsResetMemoryOnFlush(void) {
+    if (!server.cluster_enabled || !server.cluster_slot_stats_enabled) return;
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        server.cluster->slot_stats[slot].memory_logical_bytes = 0;
+    }
+    /* The key_mem_cache hashtable is emptied by the DB flush itself
+     * (emptyDbAsync recreates it). */
+}
+
+/* Called from dbAddRDBLoad to track keys loaded from RDB. */
+void clusterSlotStatsTrackRDBLoad(serverDb *db, sds key, robj *val) {
+    int slot = getKVStoreIndexForKey(key);
+    if (!clusterSlotStatsEnabled(slot)) return;
+
+    size_t logical = objectLogicalSize(val);
+    server.cluster->slot_stats[slot].memory_logical_bytes += (int64_t)logical;
+
+    if (db->key_mem_cache) {
+        keySizeCacheEntry *e = zmalloc(sizeof(keySizeCacheEntry));
+        e->key = sdsdup(key);
+        e->logical_bytes = logical;
+        hashtableAdd(db->key_mem_cache, e);
+    }
 }

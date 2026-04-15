@@ -37,6 +37,7 @@
 #include "module.h"
 #include "vector.h"
 #include "expire.h"
+#include "cluster_slot_stats.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -287,6 +288,8 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
 
     /* Track hash objects containing volatile items, created by rdbLoadObject (which lacks DB context). */
     dbTrackKeyWithVolatileItems(db, val);
+
+    clusterSlotStatsTrackRDBLoad(db, key, val);
 
     *valref = val;
     return 1;
@@ -628,6 +631,9 @@ long long emptyDbStructure(serverDb **dbarray, int dbnum, int async, void(callba
             kvstoreEmpty(dbarray[j]->keys, callback);
             kvstoreEmpty(dbarray[j]->expires, callback);
             kvstoreEmpty(dbarray[j]->keys_with_volatile_items, callback);
+            if (dbarray[j]->key_mem_cache) {
+                hashtableEmpty(dbarray[j]->key_mem_cache, callback);
+            }
         }
         /* Because all keys of database are removed, reset average ttl. */
         resetDbExpiryState(dbarray[j]);
@@ -716,6 +722,7 @@ void discardTempDb(serverDb **tempDb) {
             dictRelease(tempDb[i]->blocking_keys_unblock_on_nokey);
             dictRelease(tempDb[i]->ready_keys);
             dictRelease(tempDb[i]->watched_keys);
+            if (tempDb[i]->key_mem_cache) hashtableRelease(tempDb[i]->key_mem_cache);
             zfree(tempDb[i]);
             tempDb[i] = NULL;
         }
@@ -753,6 +760,7 @@ long long dbTotalServerKeyCount(void) {
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
     touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
+    clusterSlotStatsHandleKeyModified(db, key);
 }
 
 void signalFlushedDb(int dbid, int async) {
@@ -771,6 +779,7 @@ void signalFlushedDb(int dbid, int async) {
     }
 
     trackingInvalidateKeysOnFlush(async);
+    clusterSlotStatsResetMemoryOnFlush();
 
     /* Changes in this method may take place in swapMainDbWithTempDb as well,
      * where we execute similar calls, but with subtle differences as it's
@@ -1758,12 +1767,13 @@ int dbSwapDatabases(int id1, int id2) {
     db1->keys = db2->keys;
     db1->expires = db2->expires;
     db1->keys_with_volatile_items = db2->keys_with_volatile_items;
+    db1->key_mem_cache = db2->key_mem_cache;
     copyDbExpiry(db1, db2);
-
 
     db2->keys = aux.keys;
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
+    db2->key_mem_cache = aux.key_mem_cache;
     copyDbExpiry(db2, &aux);
 
     /* Now we need to handle clients blocked on lists: as an effect
@@ -1804,11 +1814,13 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         activedb->keys = newdb->keys;
         activedb->expires = newdb->expires;
         activedb->keys_with_volatile_items = newdb->keys_with_volatile_items;
+        activedb->key_mem_cache = newdb->key_mem_cache;
         copyDbExpiry(activedb, newdb);
 
         newdb->keys = aux.keys;
         newdb->expires = aux.expires;
         newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
+        newdb->key_mem_cache = aux.key_mem_cache;
         copyDbExpiry(newdb, &aux);
 
         /* Now we need to handle clients blocked on lists: as an effect

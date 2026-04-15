@@ -1187,6 +1187,78 @@ char *strEncoding(int encoding) {
 /* =========================== Memory introspection ========================= */
 
 
+/* O(1) logical size for hash objects using tracked counters.
+ * For hashtable encoding: hashtable container + tracked entry sizes + vset container.
+ * For listpack encoding: lpBytes (already O(1)).
+ * This replaces the O(n) sampling in objectComputeSize for hash objects. */
+size_t hashTypeLogicalSize(robj *o) {
+    serverAssert(o->type == OBJ_HASH);
+    if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        return lpBytes(objectGetVal(o));
+    } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+        hashtable *ht = objectGetVal(o);
+        vset *volatile_fields = hashtableMetadata(ht);
+        size_t size = hashtableMemUsage(ht) + hashtableTrackedDataBytes(ht);
+        if (vsetIsValid(volatile_fields)) size += vsetLogicalSize(volatile_fields);
+        return size;
+    }
+    serverPanic("Unknown hash encoding");
+    return 0;
+}
+
+/* O(1) logical size of a value object, split into user data bytes and
+ * container overhead bytes. Uses incrementally maintained tracked fields
+ * where available. For types without O(1) tracking (zset skiplist),
+ * returns 0. Does not call zmalloc_size. Returns 0 if o is NULL. */
+size_t objectLogicalSize(robj *o) {
+    if (!o) return 0;
+    size_t total = 0;
+
+    if (o->type == OBJ_STRING) {
+        if (o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR) {
+            sds s = objectGetVal(o);
+            total += sdsReqSize(sdslen(s), sdsType(s));
+        }
+    } else if (o->type == OBJ_LIST) {
+        if (o->encoding == OBJ_ENCODING_QUICKLIST) {
+            quicklist *ql = objectGetVal(o);
+            total += ql->tracked_data_bytes;
+            total += sizeof(quicklist) + ql->len * sizeof(quicklistNode);
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_SET) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            total += hashtableTrackedDataBytes(ht);
+            total += hashtableMemUsage(ht);
+        } else if (o->encoding == OBJ_ENCODING_INTSET) {
+            total += intsetBlobLen(objectGetVal(o));
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_ZSET) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        }
+    } else if (o->type == OBJ_HASH) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
+            total += lpBytes(objectGetVal(o));
+        } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
+            hashtable *ht = objectGetVal(o);
+            vset *volatile_fields = hashtableMetadata(ht);
+            total += hashtableTrackedDataBytes(ht);
+            total += hashtableMemUsage(ht);
+            if (vsetIsValid(volatile_fields)) total += vsetLogicalSize(volatile_fields);
+        }
+    } else if (o->type == OBJ_STREAM) {
+        stream *s = objectGetVal(o);
+        total += s->tracked_data_bytes;
+        total += s->tracked_overhead + sizeof(stream);
+    }
+    return total;
+}
+
 /* Returns the size in bytes consumed by the key's value in RAM.
  * Note that the returned value is just an approximation, especially in the
  * case of aggregated data types where only "sample_size" elements

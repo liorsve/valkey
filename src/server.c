@@ -615,11 +615,18 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
+/* Return the logical size of an SDS entry: header + content + null terminator. */
+size_t sdsEntryGetSize(const void *entry) {
+    const_sds s = (const_sds)entry;
+    return sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+}
+
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = dictSdsDestructor,
+    .entryGetSize = sdsEntryGetSize};
 
 const void *zsetHashtableGetKey(const void *element) {
     const zskiplistNode *node = element;
@@ -714,6 +721,10 @@ size_t hashHashtableTypeMetadataSize(void) {
     return sizeof(void *);
 }
 
+size_t hashEntryGetSize(const void *entry) {
+    return entryGetLogicalSize(entry);
+}
+
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
@@ -721,6 +732,7 @@ hashtableType hashHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
@@ -729,6 +741,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
+    .entryGetSize = hashEntryGetSize,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
 };
@@ -2890,6 +2903,9 @@ serverDb *createDatabase(int id) {
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
+    db->key_mem_cache = (server.cluster_slot_stats_enabled)
+                            ? hashtableCreate(&keySizeCacheHashtableType)
+                            : NULL;
     if (clusterIsAnySlotImporting()) {
         clusterMarkImportingSlotsInDb(db);
     }
@@ -3910,6 +3926,15 @@ void call(client *c, int flags) {
     if (monotonicGetType() == MONOTONIC_CLOCK_HW) monotonic_start = getMonotonicUs();
 
     c->cmd->proc(c);
+
+    /* Hash/set reads can change hashtable overhead via incremental rehashing
+     * without signalModifiedKey firing. Check for overhead drift on argv[1]
+     * only when the key is hashtable-encoded and mid-rehash (checked inside). */
+    if (server.dirty == dirty && c->argc >= 2 && !c->flag.blocked &&
+        clusterSlotStatsEnabled(c->slot) &&
+        (c->cmd->group == COMMAND_GROUP_HASH || c->cmd->group == COMMAND_GROUP_SET)) {
+        clusterSlotStatsHandleRehashOverhead(c);
+    }
 
     exitExecutionUnit();
 
