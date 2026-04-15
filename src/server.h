@@ -3584,7 +3584,7 @@ int hashTypeExists(robj *o, sds key);
 bool hashTypeDelete(robj *o, sds key);
 unsigned long hashTypeLength(const robj *o);
 size_t hashTypeLogicalSize(robj *o);
-void objectLogicalSize(robj *o, size_t *data_bytes, size_t *overhead_bytes);
+size_t objectLogicalSize(robj *o);
 void hashTypeInitIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeInitVolatileIterator(robj *subject, hashTypeIterator *hi);
 void hashTypeResetIterator(hashTypeIterator *hi);

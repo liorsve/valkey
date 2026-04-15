@@ -13,7 +13,7 @@ void clusterSlotStatsAddCpuDuration(client *c, ustime_t duration);
 /* network-bytes-in metric. */
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c);
 
-/* memory-data-bytes / memory-overhead-bytes metrics. */
+/* memory-logical-bytes metric. */
 extern hashtableType keySizeCacheHashtableType;
 void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key);
 void clusterSlotStatsHandleRehashOverhead(client *c);

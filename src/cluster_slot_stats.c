@@ -12,8 +12,7 @@ typedef enum {
     CPU_USEC,
     NETWORK_BYTES_IN,
     NETWORK_BYTES_OUT,
-    DATA_BYTES,
-    OVERHEAD_BYTES,
+    MEMORY_LOGICAL_BYTES,
     SLOT_STAT_COUNT,
     INVALID
 } slotStatType;
@@ -53,8 +52,7 @@ static uint64_t getSlotStat(int slot, slotStatType stat_type) {
     case CPU_USEC: slot_stat = server.cluster->slot_stats[slot].cpu_usec; break;
     case NETWORK_BYTES_IN: slot_stat = server.cluster->slot_stats[slot].network_bytes_in; break;
     case NETWORK_BYTES_OUT: slot_stat = server.cluster->slot_stats[slot].network_bytes_out; break;
-    case DATA_BYTES: slot_stat = server.cluster->slot_stats[slot].data_bytes; break;
-    case OVERHEAD_BYTES: slot_stat = server.cluster->slot_stats[slot].overhead_bytes; break;
+    case MEMORY_LOGICAL_BYTES: slot_stat = server.cluster->slot_stats[slot].memory_logical_bytes; break;
     case SLOT_STAT_COUNT:
     case INVALID: serverPanic("Invalid slot stat type %d was found.", stat_type);
     }
@@ -112,10 +110,8 @@ static void addReplySlotStat(client *c, int slot) {
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_in);
         addReplyBulkCString(c, "network-bytes-out");
         addReplyLongLong(c, server.cluster->slot_stats[slot].network_bytes_out);
-        addReplyBulkCString(c, "memory-data-bytes");
-        addReplyLongLong(c, server.cluster->slot_stats[slot].data_bytes);
-        addReplyBulkCString(c, "memory-overhead-bytes");
-        addReplyLongLong(c, server.cluster->slot_stats[slot].overhead_bytes);
+        addReplyBulkCString(c, "memory-logical-bytes");
+        addReplyLongLong(c, server.cluster->slot_stats[slot].memory_logical_bytes);
     }
 }
 
@@ -295,10 +291,8 @@ void clusterSlotStatsCommand(client *c) {
             order_by = NETWORK_BYTES_IN;
         } else if (!strcasecmp(objectGetVal(c->argv[3]), "network-bytes-out") && server.cluster_slot_stats_enabled) {
             order_by = NETWORK_BYTES_OUT;
-        } else if (!strcasecmp(objectGetVal(c->argv[3]), "memory-data-bytes") && server.cluster_slot_stats_enabled) {
-            order_by = DATA_BYTES;
-        } else if (!strcasecmp(objectGetVal(c->argv[3]), "memory-overhead-bytes") && server.cluster_slot_stats_enabled) {
-            order_by = OVERHEAD_BYTES;
+        } else if (!strcasecmp(objectGetVal(c->argv[3]), "memory-logical-bytes") && server.cluster_slot_stats_enabled) {
+            order_by = MEMORY_LOGICAL_BYTES;
         } else {
             addReplyError(c, "Unrecognized sort metric for ORDERBY.");
             return;
@@ -346,7 +340,7 @@ int clusterSlotStatsEnabled(int slot) {
 /* --------------------------------------------------------------------------
  * Per-slot memory tracking via per-key size cache + signalModifiedKey.
  *
- * Each key has a cached {data_bytes, overhead_bytes} in a single hashtable
+ * Each key has a cached logical_bytes in a single hashtable
  * (db->key_mem_cache). signalModifiedKey is the single hook: it computes
  * the current objectLogicalSize, diffs against the cached value, updates
  * slot_stats, and refreshes the cache. For deleted keys, current=0 and the
@@ -357,8 +351,7 @@ int clusterSlotStatsEnabled(int slot) {
 /* Cache entry stored in db->key_mem_cache. */
 typedef struct keySizeCacheEntry {
     sds key;
-    size_t data_bytes;
-    size_t overhead_bytes;
+    size_t logical_bytes;
 } keySizeCacheEntry;
 
 static const void *keySizeCacheGetKey(const void *entry) {
@@ -388,38 +381,30 @@ void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key) {
 
     /* Look up current value (NULL if key was just deleted). */
     robj *val = dbFind(db, keyname);
-    size_t cur_data = 0, cur_overhead = 0;
-    if (val) {
-        objectLogicalSize(val, &cur_data, &cur_overhead);
-    }
+    size_t cur_logical = objectLogicalSize(val);
 
     /* Look up cached size. */
-    size_t old_data = 0, old_overhead = 0;
+    size_t old_logical = 0;
     void *existing = NULL;
     int found = hashtableFind(db->key_mem_cache, keyname, &existing);
     if (found) {
         keySizeCacheEntry *cached = existing;
-        old_data = cached->data_bytes;
-        old_overhead = cached->overhead_bytes;
+        old_logical = cached->logical_bytes;
     }
 
     /* Apply delta to slot stats. */
-    int64_t data_delta = (int64_t)cur_data - (int64_t)old_data;
-    int64_t overhead_delta = (int64_t)cur_overhead - (int64_t)old_overhead;
-    if (data_delta != 0) server.cluster->slot_stats[slot].data_bytes += data_delta;
-    if (overhead_delta != 0) server.cluster->slot_stats[slot].overhead_bytes += overhead_delta;
+    int64_t delta = (int64_t)cur_logical - (int64_t)old_logical;
+    if (delta != 0) server.cluster->slot_stats[slot].memory_logical_bytes += delta;
 
     /* Update or remove cache entry. */
     if (val) {
         if (found) {
             keySizeCacheEntry *cached = existing;
-            cached->data_bytes = cur_data;
-            cached->overhead_bytes = cur_overhead;
+            cached->logical_bytes = cur_logical;
         } else {
             keySizeCacheEntry *e = zmalloc(sizeof(keySizeCacheEntry));
             e->key = sdsdup(keyname);
-            e->data_bytes = cur_data;
-            e->overhead_bytes = cur_overhead;
+            e->logical_bytes = cur_logical;
             hashtableAdd(db->key_mem_cache, e);
         }
     } else {
@@ -432,7 +417,7 @@ void clusterSlotStatsHandleKeyModified(serverDb *db, robj *key) {
 
 /* Called from call() after read commands on hashtable-encoded values.
  * Detects overhead changes from incremental rehashing during reads.
- * Compares current hashtableMemUsage against the cached overhead —
+ * Compares current objectLogicalSize against the cached logical_bytes —
  * only refreshes the cache when they differ. O(1) per call. */
 void clusterSlotStatsHandleRehashOverhead(client *c) {
     if (!c->db->key_mem_cache) return;
@@ -448,23 +433,16 @@ void clusterSlotStatsHandleRehashOverhead(client *c) {
     if (val->encoding != OBJ_ENCODING_HASHTABLE) return;
     if (val->type != OBJ_SET && val->type != OBJ_HASH) return;
 
-    hashtable *ht = objectGetVal(val);
-    size_t current_overhead = hashtableMemUsage(ht);
-    if (val->type == OBJ_HASH) {
-        vset *volatile_fields = hashtableMetadata(ht);
-        if (vsetIsValid(volatile_fields)) current_overhead += vsetLogicalSize(volatile_fields);
-    }
-
-    /* Check if cached overhead differs from current. */
+    size_t current = objectLogicalSize(val);
     void *cache_entry = NULL;
     if (!hashtableFind(c->db->key_mem_cache, keyname, &cache_entry)) return;
     keySizeCacheEntry *cached = cache_entry;
-    if (cached->overhead_bytes == current_overhead) return;
+    if (cached->logical_bytes == current) return;
 
-    /* Overhead changed — update slot stats and cache. */
-    int64_t delta = (int64_t)current_overhead - (int64_t)cached->overhead_bytes;
-    server.cluster->slot_stats[slot].overhead_bytes += delta;
-    cached->overhead_bytes = current_overhead;
+    /* Logical size changed — update slot stats and cache. */
+    int64_t delta = (int64_t)current - (int64_t)cached->logical_bytes;
+    server.cluster->slot_stats[slot].memory_logical_bytes += delta;
+    cached->logical_bytes = current;
 }
 
 /* Active-defrag callback for key_mem_cache entries.
@@ -490,8 +468,7 @@ void clusterSlotStatsDefragKeySizeCache(void *privdata, void *entry_ref) {
 void clusterSlotStatsResetMemoryOnFlush(void) {
     if (!server.cluster_enabled || !server.cluster_slot_stats_enabled) return;
     for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
-        server.cluster->slot_stats[slot].data_bytes = 0;
-        server.cluster->slot_stats[slot].overhead_bytes = 0;
+        server.cluster->slot_stats[slot].memory_logical_bytes = 0;
     }
     /* The key_mem_cache hashtable is emptied by the DB flush itself
      * (emptyDbAsync recreates it). */
@@ -502,16 +479,13 @@ void clusterSlotStatsTrackRDBLoad(serverDb *db, sds key, robj *val) {
     int slot = getKVStoreIndexForKey(key);
     if (!clusterSlotStatsEnabled(slot)) return;
 
-    size_t data, overhead;
-    objectLogicalSize(val, &data, &overhead);
-    server.cluster->slot_stats[slot].data_bytes += (int64_t)data;
-    server.cluster->slot_stats[slot].overhead_bytes += (int64_t)overhead;
+    size_t logical = objectLogicalSize(val);
+    server.cluster->slot_stats[slot].memory_logical_bytes += (int64_t)logical;
 
     if (db->key_mem_cache) {
         keySizeCacheEntry *e = zmalloc(sizeof(keySizeCacheEntry));
         e->key = sdsdup(key);
-        e->data_bytes = data;
-        e->overhead_bytes = overhead;
+        e->logical_bytes = logical;
         hashtableAdd(db->key_mem_cache, e);
     }
 }
